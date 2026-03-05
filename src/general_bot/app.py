@@ -6,6 +6,7 @@ from aiogram.types import Update, User
 
 from general_bot import handlers
 from general_bot.config import config
+from general_bot.services import Services
 from general_bot.types import Handler, MiddlewareData
 
 
@@ -15,6 +16,7 @@ def run() -> None:
 
 async def _main() -> None:
     dp = Dispatcher()
+    dp['services'] = Services()
     dp.include_router(handlers.router)
 
     @dp.update.middleware()
