@@ -13,10 +13,18 @@ router = Router()
 
 class VideoAction(StrEnum):
     NORMALIZE = auto()
+    CANCEL = auto()
 
 
 class VideoCallback(CallbackData, prefix='video'):
     action: VideoAction
+
+
+def _create_video_action_button(action: VideoAction) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text=action.title(),
+        callback_data=VideoCallback(action=action).pack(),
+    )
 
 
 @router.message()
@@ -36,13 +44,12 @@ async def on_message_buffer_and_schedule_action_selection(message: Message, serv
             await message.answer('No videos found')
             return
 
-        normalize_button = InlineKeyboardButton(
-            text=VideoAction.NORMALIZE.title(),
-            callback_data=VideoCallback(action=VideoAction.NORMALIZE).pack(),
-        )
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
-                [normalize_button],
+                [
+                    _create_video_action_button(VideoAction.NORMALIZE),
+                    _create_video_action_button(VideoAction.CANCEL),
+                ],
             ]
         )
         await message.answer(f'Found {len(video_messages)} videos', reply_markup=keyboard)
@@ -55,16 +62,27 @@ async def on_message_buffer_and_schedule_action_selection(message: Message, serv
 
 
 @router.callback_query(VideoCallback.filter())
-async def on_video_action(callback: CallbackQuery, callback_data: VideoCallback) -> None:
+async def on_video_action(callback: CallbackQuery, callback_data: VideoCallback, services: Services) -> None:
+    await callback.answer()
     # In inline-mode callbacks Telegram provides `inline_message_id` instead of `message`
     if callback.message is None:
         return
+    if (user := callback.from_user) is None:
+        return
 
-    text = dedent(
+    updated_text = dedent(
         f"""
         {callback.message.text}
     
         Selected: {callback_data.action.title()}
         """
     ).strip()
-    await callback.message.edit_text(text, reply_markup=None)
+    await callback.message.edit_text(updated_text, reply_markup=None)
+
+    match callback_data.action:
+        case VideoAction.NORMALIZE:
+            messages = services.message_buffer.flush(user)
+            ...
+        case VideoAction.CANCEL:
+            services.message_buffer.flush(user)
+            await callback.message.answer('Canceled')
