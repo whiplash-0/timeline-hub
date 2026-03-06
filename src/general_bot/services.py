@@ -15,8 +15,7 @@ Messages = list[Message]
 
 
 class TaskScheduler:
-    """
-    Per-user delayed task scheduler with debounce semantics.
+    """Per-user delayed task scheduler with debounce semantics.
 
     Each user can have at most one pending timer. Calling `schedule()` cancels
     the previous timer and starts a new one that will run `job()` after `delay`.
