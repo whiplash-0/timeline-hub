@@ -6,7 +6,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Config(BaseSettings):
     bot_token: str
     allowlist: list[int]
+
     forward_batch_timeout: timedelta = timedelta(seconds=0.5)
+    normalization_loudness: float = -14
 
     model_config = SettingsConfigDict(
         env_file='.env',

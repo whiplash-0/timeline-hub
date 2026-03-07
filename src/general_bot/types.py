@@ -5,4 +5,6 @@ from aiogram.types import TelegramObject
 
 MiddlewareData = dict[str, Any]
 Handler = Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]]
+
+ChatId = int
 UserId = int
