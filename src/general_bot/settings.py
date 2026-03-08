@@ -23,6 +23,7 @@ class Settings(BaseSettings):
 
     forward_batch_timeout: timedelta = timedelta(seconds=0.25)
     normalization_loudness: float = -14
+    normalization_bitrate: int = 128
 
     model_config = _CONFIG
 

@@ -105,7 +105,11 @@ async def on_clip_action(
 
                 # Limit concurrent CPU-bound video processing to avoid overloading the constrained runtime
                 async with cpu_semaphore:
-                    return await normalize_video_volume(video_bytes, loudness=settings.normalization_loudness)
+                    return await normalize_video_volume(
+                        video_bytes,
+                        loudness=settings.normalization_loudness,
+                        bitrate=settings.normalization_bitrate,
+                    )
 
             for message_group in message_groups:
                 replacement_videos = await asyncio.wait_for(
