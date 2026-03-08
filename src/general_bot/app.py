@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import logging
 import sys
 from typing import Any
 
@@ -37,7 +38,9 @@ async def _main(settings: Settings) -> None:
         return await handler(update, data)
 
     async with Bot(settings.bot_token) as bot:
+        logger.info('Starting bot polling')
         await dp.start_polling(bot, polling_timeout=30)
+        logger.info('Bot polling stopped')
 
 
 def _configure_logging() -> None:
@@ -49,6 +52,8 @@ def _configure_logging() -> None:
         backtrace=False,
         diagnose=False,
     )
+    # Hide normal 'SIGINT` signal logs when shutting bot down
+    logging.getLogger('aiogram').setLevel(logging.ERROR)
 
 
 def _parse_args() -> argparse.Namespace:
