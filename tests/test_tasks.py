@@ -1,10 +1,11 @@
 import asyncio
 from collections.abc import Iterator
+from datetime import timedelta
 
 import pytest
 from loguru import logger
 
-from general_bot.infra.tasks import TaskFailure, TaskSupervisor
+from general_bot.infra.tasks import TaskFailure, TaskScheduler, TaskSupervisor
 
 
 @pytest.fixture
@@ -154,3 +155,124 @@ async def test_cancel_all_cancels_pending_tasks() -> None:
 
     assert task_a.cancelled()
     assert task_b.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_runs_job_after_delay() -> None:
+    supervisor = TaskSupervisor()
+    scheduler = TaskScheduler(task_supervisor=supervisor)
+    ran = asyncio.Event()
+
+    async def job() -> None:
+        ran.set()
+
+    scheduler.schedule(job, key='chat-1', delay=timedelta(seconds=0.03))
+    await asyncio.sleep(0.01)
+    assert not ran.is_set()
+
+    await asyncio.wait_for(ran.wait(), timeout=0.2)
+    await supervisor.wait()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_debounces_same_key_and_runs_only_last_job() -> None:
+    supervisor = TaskSupervisor()
+    scheduler = TaskScheduler(task_supervisor=supervisor)
+    calls: list[str] = []
+    done = asyncio.Event()
+
+    async def first_job() -> None:
+        calls.append('first')
+
+    async def second_job() -> None:
+        calls.append('second')
+        done.set()
+
+    scheduler.schedule(first_job, key='chat-1', delay=timedelta(seconds=0.03))
+    await asyncio.sleep(0.005)
+    scheduler.schedule(second_job, key='chat-1', delay=timedelta(seconds=0.03))
+
+    await asyncio.wait_for(done.wait(), timeout=0.2)
+    await asyncio.sleep(0.05)
+    await supervisor.wait()
+
+    assert calls == ['second']
+
+
+@pytest.mark.asyncio
+async def test_scheduler_runs_different_keys_independently() -> None:
+    supervisor = TaskSupervisor()
+    scheduler = TaskScheduler(task_supervisor=supervisor)
+    first_ran = asyncio.Event()
+    second_ran = asyncio.Event()
+    calls: list[str] = []
+
+    async def first_job() -> None:
+        calls.append('first')
+        first_ran.set()
+
+    async def second_job() -> None:
+        calls.append('second')
+        second_ran.set()
+
+    scheduler.schedule(first_job, key='chat-1', delay=timedelta(seconds=0.02))
+    scheduler.schedule(second_job, key='chat-2', delay=timedelta(seconds=0.03))
+
+    await asyncio.wait_for(first_ran.wait(), timeout=0.2)
+    await asyncio.wait_for(second_ran.wait(), timeout=0.2)
+    await supervisor.wait()
+
+    assert set(calls) == {'first', 'second'}
+
+
+@pytest.mark.asyncio
+async def test_scheduler_cancel_prevents_job_execution() -> None:
+    supervisor = TaskSupervisor()
+    scheduler = TaskScheduler(task_supervisor=supervisor)
+    ran = asyncio.Event()
+
+    async def job() -> None:
+        ran.set()
+
+    scheduler.schedule(job, key='chat-1', delay=timedelta(seconds=0.03))
+    scheduler.cancel('chat-1')
+
+    await asyncio.sleep(0.06)
+    await supervisor.wait()
+
+    assert not ran.is_set()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_does_not_cancel_job_after_it_starts_running() -> None:
+    supervisor = TaskSupervisor()
+    scheduler = TaskScheduler(task_supervisor=supervisor)
+    first_started = asyncio.Event()
+    first_completed = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    allow_first_to_finish = asyncio.Event()
+    second_ran = asyncio.Event()
+
+    async def first_job() -> None:
+        first_started.set()
+        try:
+            await allow_first_to_finish.wait()
+            first_completed.set()
+        except asyncio.CancelledError:
+            first_cancelled.set()
+            raise
+
+    async def second_job() -> None:
+        second_ran.set()
+
+    scheduler.schedule(first_job, key='chat-1', delay=timedelta(seconds=0.01))
+    await asyncio.wait_for(first_started.wait(), timeout=0.2)
+
+    scheduler.schedule(second_job, key='chat-1', delay=timedelta(seconds=0.01))
+    allow_first_to_finish.set()
+
+    await asyncio.wait_for(first_completed.wait(), timeout=0.2)
+    await asyncio.wait_for(second_ran.wait(), timeout=0.2)
+    await supervisor.wait()
+
+    assert not first_cancelled.is_set()
