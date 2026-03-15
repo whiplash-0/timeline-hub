@@ -3,7 +3,8 @@ from collections.abc import Sequence
 from enum import StrEnum, auto
 from textwrap import dedent
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatType
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import BufferedInputFile, CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo, Message
 from loguru import logger
@@ -31,16 +32,12 @@ async def on_error_shutdown(_: ErrorEvent, dispatcher: Dispatcher) -> None:
     await dispatcher.stop_polling()
 
 
-@router.message()
+@router.message(F.chat.type == ChatType.PRIVATE)
 async def on_message_buffer_and_schedule_clip_action_selection(
     message: Message,
     services: Services,
     settings: Settings,
 ) -> None:
-    # Channel or chat may also send a message
-    if message.from_user is None:
-        return
-
     user = message.from_user
     chat_id = message.chat.id
     services.chat_message_buffer.append(message, chat_id=chat_id)
@@ -74,7 +71,10 @@ async def on_message_buffer_and_schedule_clip_action_selection(
     )
 
 
-@router.callback_query(ClipCallbackData.filter())
+@router.callback_query(
+    ClipCallbackData.filter(),
+    F.message.chat.type == ChatType.PRIVATE,
+)
 async def on_clip_action(
     callback: CallbackQuery,
     callback_data: ClipCallbackData,
@@ -83,11 +83,6 @@ async def on_clip_action(
     settings: Settings,
 ) -> None:
     await callback.answer()
-    # In inline-mode callbacks Telegram provides `inline_message_id` instead of `message`
-    if callback.message is None:
-        return
-    if callback.from_user is None:
-        return
     chat_id = callback.message.chat.id
 
     updated_text = dedent(
