@@ -3,6 +3,8 @@ from typing import Self
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from general_bot.types import UserId
+
 _CONFIG = SettingsConfigDict(
     env_file='.env',
     frozen=True,
@@ -18,11 +20,19 @@ class _BotTokenSettings(BaseSettings):
 
 
 class Settings(BaseSettings):
+    # Telegram Bot API token used to authenticate the bot with Telegram
     bot_token: str
-    allowlist: list[int]
 
+    # Telegram user IDs allowed to interact with the bot
+    user_allowlist: list[UserId]
+
+    # Delay used to batch forwarded messages before responding
     forward_batch_timeout: timedelta = timedelta(seconds=0.25)
+
+    # Target loudness for normalized clips (LUFS)
     normalization_loudness: float = -14
+
+    # Output bitrate for normalized clips (kbps)
     normalization_bitrate: int = 128
 
     model_config = _CONFIG

@@ -40,7 +40,7 @@ async def _main(settings: Settings) -> None:
         user: User | None = data.get('event_from_user')
         if user is None:
             return None
-        if user.id not in settings.allowlist:
+        if user.id not in settings.user_allowlist:
             logger.info('User {} (@{} {!r}) attempting to use bot', user.id, user.username or '', user.full_name)
             return None
         return await handler(update, data)
