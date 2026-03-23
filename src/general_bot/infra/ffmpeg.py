@@ -6,14 +6,14 @@ from datetime import timedelta
 from pathlib import Path
 
 
-async def normalize_video_volume(
+async def normalize_audio_loudness(
     video_bytes: bytes,
     *,
     loudness: float = -14,
     bitrate: int = 128,
     timeout: timedelta = timedelta(seconds=30),
 ) -> bytes:
-    """Normalize video audio volume with 2-pass `loudnorm`.
+    """Normalize video audio loudness with 2-pass `loudnorm`.
 
     The original video stream is copied unchanged, while the audio stream is
     normalized and re-encoded.
@@ -38,7 +38,6 @@ async def normalize_video_volume(
     try:
         input_path.write_bytes(video_bytes)
 
-        # Step #1: Analysis
         analysis_cmd = (
             'ffmpeg',
             '-hide_banner',
@@ -67,7 +66,6 @@ async def normalize_video_volume(
             raise RuntimeError(f'ffmpeg analysis output did not contain loudnorm JSON: {analysis_text}')
         stats = json.loads(analysis_text[json_start : json_end + 1])
 
-        # Step #2: Normalization
         normalize_filter = (
             f'loudnorm=I={loudness}:TP=-1.5:LRA=7:'
             f'measured_I={stats["input_i"]}:'

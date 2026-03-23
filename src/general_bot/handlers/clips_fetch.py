@@ -12,10 +12,10 @@ from general_bot.handlers.clips_common import (
     ALL_SCOPES_CALLBACK_VALUE,
     FETCH_STATE_BY_STEP,
     FLOW_FETCH,
+    FLOW_FETCH_RAW,
     MenuAction,
     MenuStep,
     callback_message,
-    dummy_button,
     encode_sub_season,
     handle_stale_selection,
     parse_scope,
@@ -49,6 +49,7 @@ from general_bot.handlers.clips_flow import (
     validate_menu_flow_state,
     year_option_universe,
 )
+from general_bot.infra.ffmpeg import normalize_audio_loudness
 from general_bot.services.clip_store import (
     Clip,
     ClipGroup,
@@ -67,7 +68,8 @@ router = Router()
 
 
 class FetchEntryAction(StrEnum):
-    OPEN = auto()
+    FETCH = auto()
+    FETCH_RAW = auto()
     CANCEL = auto()
 
 
@@ -88,6 +90,13 @@ def _pack_fetch_menu_callback(action: MenuAction, step: MenuStep, value: str) ->
 _FETCH_FLOW = FlowMenuDefinition(
     mode=FLOW_FETCH,
     flow_label='Fetch',
+    state_by_step=FETCH_STATE_BY_STEP,
+    pack_callback=_pack_fetch_menu_callback,
+)
+
+_FETCH_RAW_FLOW = FlowMenuDefinition(
+    mode=FLOW_FETCH_RAW,
+    flow_label='Fetch raw',
     state_by_step=FETCH_STATE_BY_STEP,
     pack_callback=_pack_fetch_menu_callback,
 )
@@ -130,6 +139,11 @@ async def on_fetch_entry(
         )
         return
 
+    flow = _flow_for_entry_action(callback_data.action)
+    if flow is None:
+        await state.clear()
+        return
+
     groups = await services.clip_store.list_groups()
     if not groups:
         await terminate_menu(
@@ -143,6 +157,7 @@ async def on_fetch_entry(
         message=message,
         state=state,
         settings=settings,
+        flow=flow,
         groups=groups,
     )
 
@@ -165,10 +180,16 @@ async def on_fetch_menu(
         await state.clear()
         return
 
+    data = await state.get_data()
+    flow = _flow_for_mode(data.get('mode'))
+    if flow is None:
+        await handle_stale_selection(message=message, state=state)
+        return
+
     if not await validate_menu_flow_state(
         message=message,
         state=state,
-        flow=_FETCH_FLOW,
+        flow=flow,
         step=callback_data.step,
     ):
         return
@@ -180,6 +201,7 @@ async def on_fetch_menu(
             services=services,
             settings=settings,
             step=callback_data.step,
+            flow=flow,
         )
         return
 
@@ -190,6 +212,7 @@ async def on_fetch_menu(
         settings=settings,
         bot=bot,
         callback_data=callback_data,
+        flow=flow,
     )
 
 
@@ -200,6 +223,7 @@ async def _on_fetch_back(
     services: Services,
     settings: Settings,
     step: MenuStep,
+    flow: FlowMenuDefinition,
 ) -> None:
     data = await state.get_data()
 
@@ -214,6 +238,7 @@ async def _on_fetch_back(
                 state=state,
                 settings=settings,
                 services=services,
+                flow=flow,
             )
 
         case MenuStep.UNIVERSE:
@@ -228,6 +253,7 @@ async def _on_fetch_back(
                 year=year,
                 services=services,
                 settings=settings,
+                flow=flow,
             )
 
         case MenuStep.SUB_SEASON:
@@ -244,6 +270,7 @@ async def _on_fetch_back(
                 season=season,
                 services=services,
                 settings=settings,
+                flow=flow,
             )
 
         case MenuStep.SCOPE:
@@ -271,6 +298,7 @@ async def _on_fetch_back(
                     season=season,
                     services=services,
                     settings=settings,
+                    flow=flow,
                 )
                 return
 
@@ -282,6 +310,7 @@ async def _on_fetch_back(
                 services=services,
                 settings=settings,
                 sub_groups=sub_groups,
+                flow=flow,
             )
 
 
@@ -293,6 +322,7 @@ async def _on_fetch_select(
     settings: Settings,
     bot: Bot,
     callback_data: FetchCallbackData,
+    flow: FlowMenuDefinition,
 ) -> None:
     data = await state.get_data()
 
@@ -309,6 +339,7 @@ async def _on_fetch_select(
                 year=year,
                 services=services,
                 settings=settings,
+                flow=flow,
             )
 
         case MenuStep.SEASON:
@@ -325,6 +356,7 @@ async def _on_fetch_select(
                 season=season,
                 services=services,
                 settings=settings,
+                flow=flow,
             )
 
         case MenuStep.UNIVERSE:
@@ -342,6 +374,7 @@ async def _on_fetch_select(
                 clip_group=clip_group,
                 services=services,
                 settings=settings,
+                flow=flow,
             )
 
         case MenuStep.SUB_SEASON:
@@ -351,16 +384,16 @@ async def _on_fetch_select(
                 await handle_stale_selection(message=message, state=state)
                 return
             year, season, universe = selection
+            clip_group = ClipGroup(year=year, season=season, universe=universe)
             await show_or_stale(
                 show_menu=_show_fetch_scope_menu,
                 message=message,
                 state=state,
-                year=year,
-                season=season,
-                universe=universe,
+                clip_group=clip_group,
                 sub_season=sub_season,
                 services=services,
                 settings=settings,
+                flow=flow,
             )
 
         case MenuStep.SCOPE:
@@ -386,7 +419,7 @@ async def _on_fetch_select(
 
             if callback_data.value == ALL_SCOPES_CALLBACK_VALUE:
                 selected_labels = flow_selection_labels(
-                    _FETCH_FLOW,
+                    flow,
                     year=year,
                     season=season,
                     universe=universe,
@@ -400,7 +433,7 @@ async def _on_fetch_select(
                     return
                 scopes = [scope]
                 selected_labels = flow_selection_labels(
-                    _FETCH_FLOW,
+                    flow,
                     year=year,
                     season=season,
                     universe=universe,
@@ -420,6 +453,8 @@ async def _on_fetch_select(
                     clip_group=clip_group,
                     sub_season=sub_season,
                     scopes=scopes,
+                    settings=settings,
+                    normalize_audio=_normalizes_audio(flow),
                 )
             except ClipGroupNotFoundError:
                 await handle_stale_selection(message=message, state=state)
@@ -432,6 +467,7 @@ async def _show_fetch_year_menu(
     message: Message,
     state: FSMContext,
     settings: Settings,
+    flow: FlowMenuDefinition = _FETCH_FLOW,
     services: Services | None = None,
     groups: list[ClipGroup] | None = None,
 ) -> bool:
@@ -446,7 +482,7 @@ async def _show_fetch_year_menu(
     year_universe = year_option_universe(current_year=date.today().year, min_year=settings.min_clip_year)
 
     await show_fixed_option_menu(
-        flow=_FETCH_FLOW,
+        flow=flow,
         message=message,
         state=state,
         message_width=settings.message_width,
@@ -467,6 +503,7 @@ async def _show_fetch_season_menu(
     year: int,
     services: Services,
     settings: Settings,
+    flow: FlowMenuDefinition = _FETCH_FLOW,
 ) -> bool:
     groups = await services.clip_store.list_groups()
     available_seasons = available_group_seasons(groups, year=year)
@@ -476,7 +513,7 @@ async def _show_fetch_season_menu(
         return False
 
     await show_fixed_option_menu(
-        flow=_FETCH_FLOW,
+        flow=flow,
         message=message,
         state=state,
         message_width=settings.message_width,
@@ -499,6 +536,7 @@ async def _show_fetch_universe_menu(
     season: Season,
     services: Services,
     settings: Settings,
+    flow: FlowMenuDefinition = _FETCH_FLOW,
 ) -> bool:
     groups = await services.clip_store.list_groups()
     available_universes = available_group_universes(groups, year=year, season=season)
@@ -506,7 +544,7 @@ async def _show_fetch_universe_menu(
         return False
 
     await show_fixed_option_menu(
-        flow=_FETCH_FLOW,
+        flow=flow,
         message=message,
         state=state,
         message_width=settings.message_width,
@@ -529,6 +567,7 @@ async def _show_fetch_sub_season_menu(
     clip_group: ClipGroup,
     services: Services,
     settings: Settings,
+    flow: FlowMenuDefinition = _FETCH_FLOW,
     sub_groups: list[ClipSubGroup] | None = None,
 ) -> bool:
     if sub_groups is None:
@@ -549,9 +588,10 @@ async def _show_fetch_sub_season_menu(
             services=services,
             settings=settings,
             sub_groups=sub_groups,
+            flow=flow,
         )
     await show_fixed_option_menu(
-        flow=_FETCH_FLOW,
+        flow=flow,
         message=message,
         state=state,
         message_width=settings.message_width,
@@ -576,6 +616,7 @@ async def _show_fetch_scope_menu(
     sub_season: SubSeason,
     services: Services,
     settings: Settings,
+    flow: FlowMenuDefinition = _FETCH_FLOW,
     sub_groups: list[ClipSubGroup] | None = None,
 ) -> bool:
     if sub_groups is None:
@@ -593,7 +634,7 @@ async def _show_fetch_scope_menu(
     available_scope_options: list[Scope | str] = [ALL_SCOPES_CALLBACK_VALUE, *scopes]
 
     await show_fixed_option_menu(
-        flow=_FETCH_FLOW,
+        flow=flow,
         message=message,
         state=state,
         message_width=settings.message_width,
@@ -619,6 +660,8 @@ async def _send_fetch_scopes(
     clip_group: ClipGroup,
     sub_season: SubSeason,
     scopes: Sequence[Scope],
+    settings: Settings,
+    normalize_audio: bool,
 ) -> None:
     for index, scope in enumerate(scopes):
         if index > 0:
@@ -628,7 +671,10 @@ async def _send_fetch_scopes(
             clip_group=clip_group,
             clip_sub_group=ClipSubGroup(sub_season=sub_season, scope=scope),
         ):
-            await _send_stored_clip_batch(bot=bot, chat_id=chat_id, clips=batch)
+            clips = batch
+            if normalize_audio:
+                clips = await _normalize_clip_batch(clips=clips, settings=settings)
+            await _send_stored_clip_batch(bot=bot, chat_id=chat_id, clips=clips)
 
     await bot.send_message(chat_id=chat_id, text='Done')
 
@@ -661,6 +707,31 @@ async def _send_stored_clip_batch(
     )
 
 
+async def _normalize_clip_batch(
+    *,
+    clips: Sequence[Clip],
+    settings: Settings,
+) -> list[Clip]:
+    """Normalize fetched clip audio in memory before sending.
+
+    Preserves clip order inside the fetched batch and never mutates stored
+    clip objects in S3.
+    """
+    normalized_clips: list[Clip] = []
+    for clip in clips:
+        normalized_clips.append(
+            Clip(
+                filename=clip.filename,
+                bytes=await normalize_audio_loudness(
+                    clip.bytes,
+                    loudness=settings.normalization_loudness,
+                    bitrate=settings.normalization_bitrate,
+                ),
+            )
+        )
+    return normalized_clips
+
+
 async def _fetch_sub_groups(
     *,
     services: Services,
@@ -677,9 +748,12 @@ def _fetch_entry_reply_markup():
         buttons=[
             InlineKeyboardButton(
                 text='Fetch',
-                callback_data=FetchEntryCallbackData(action=FetchEntryAction.OPEN).pack(),
+                callback_data=FetchEntryCallbackData(action=FetchEntryAction.FETCH).pack(),
             ),
-            dummy_button(),
+            InlineKeyboardButton(
+                text='Fetch raw',
+                callback_data=FetchEntryCallbackData(action=FetchEntryAction.FETCH_RAW).pack(),
+            ),
             InlineKeyboardButton(
                 text='Cancel',
                 callback_data=FetchEntryCallbackData(action=FetchEntryAction.CANCEL).pack(),
@@ -697,3 +771,25 @@ async def _show_fetch_entry_menu(*, message: Message, state: FSMContext, setting
         ),
         reply_markup=_fetch_entry_reply_markup(),
     )
+
+
+def _flow_for_entry_action(action: FetchEntryAction) -> FlowMenuDefinition | None:
+    match action:
+        case FetchEntryAction.FETCH:
+            return _FETCH_FLOW
+        case FetchEntryAction.FETCH_RAW:
+            return _FETCH_RAW_FLOW
+        case FetchEntryAction.CANCEL:
+            return None
+
+
+def _flow_for_mode(mode: object) -> FlowMenuDefinition | None:
+    if mode == _FETCH_FLOW.mode:
+        return _FETCH_FLOW
+    if mode == _FETCH_RAW_FLOW.mode:
+        return _FETCH_RAW_FLOW
+    return None
+
+
+def _normalizes_audio(flow: FlowMenuDefinition) -> bool:
+    return flow is _FETCH_FLOW

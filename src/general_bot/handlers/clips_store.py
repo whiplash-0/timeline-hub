@@ -1,5 +1,3 @@
-import asyncio
-from collections.abc import Sequence
 from datetime import date
 from enum import StrEnum, auto
 from typing import Any
@@ -8,11 +6,10 @@ from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InputMediaVideo, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.formatting import Bold, Text
 from loguru import logger
 
-from general_bot.domain import normalize_video_volume
 from general_bot.handlers.clips_common import (
     ALL_SCOPES_CALLBACK_VALUE,
     FLOW_STORE,
@@ -22,6 +19,7 @@ from general_bot.handlers.clips_common import (
     callback_message,
     create_padding_line,
     download_video_bytes,
+    dummy_button,
     format_store_summary,
     handle_stale_selection,
     parse_scope,
@@ -68,7 +66,6 @@ _TELEGRAM_MEDIA_GROUP_LIMIT = 10
 
 
 class ClipAction(StrEnum):
-    NORMALIZE = auto()
     CANCEL = auto()
     STORE = auto()
 
@@ -142,23 +139,6 @@ async def on_clip_action(
         return
 
     match callback_data.action:
-        case ClipAction.NORMALIZE:
-            await state.clear()
-            await message.edit_text(
-                **selected_text(
-                    selected=callback_data.action.title(),
-                    leading_text=message.text or 'Clips',
-                    message_width=settings.message_width,
-                ),
-                reply_markup=None,
-            )
-            await _normalize_buffered_clips(
-                bot=bot,
-                chat_id=message.chat.id,
-                services=services,
-                settings=settings,
-            )
-
         case ClipAction.CANCEL:
             await state.clear()
             await message.edit_text(
@@ -220,38 +200,6 @@ async def on_store_menu(
         bot=bot,
         callback_data=callback_data,
     )
-
-
-async def _normalize_buffered_clips(
-    *,
-    bot: Bot,
-    chat_id: ChatId,
-    services: Services,
-    settings: Settings,
-) -> None:
-    message_groups = services.chat_message_buffer.flush_grouped(chat_id)
-    cpu_semaphore = asyncio.Semaphore(1)
-
-    async def normalize_message_clip_volume(message: Message) -> bytes | None:
-        if message.video is None:
-            return None
-
-        video_bytes = await download_video_bytes(bot, file_id=message.video.file_id)
-
-        # Limit concurrent CPU-bound video processing to avoid overloading the constrained runtime.
-        async with cpu_semaphore:
-            return await normalize_video_volume(
-                video_bytes,
-                loudness=settings.normalization_loudness,
-                bitrate=settings.normalization_bitrate,
-            )
-
-    for message_group in message_groups:
-        replacement_videos = await asyncio.wait_for(
-            asyncio.gather(*(normalize_message_clip_volume(m) for m in message_group)),
-            timeout=60,
-        )
-        await _resend_message_group(bot, chat_id, message_group, replacement_videos)
 
 
 async def _on_store_back(
@@ -657,7 +605,7 @@ def _clip_action_menu_kwargs(
         'reply_markup': stacked_keyboard(
             buttons=[
                 _create_clip_action_button(ClipAction.STORE),
-                _create_clip_action_button(ClipAction.NORMALIZE),
+                dummy_button(),
                 _create_clip_action_button(ClipAction.CANCEL),
             ]
         ),
@@ -681,53 +629,6 @@ async def _show_clip_action_menu(
         await message.edit_text('No clips received', reply_markup=None)
         return
     await message.edit_text(**kwargs)
-
-
-async def _resend_message_group(
-    bot: Bot,
-    chat_id: ChatId,
-    message_group: Sequence[Message],
-    replacement_videos: Sequence[bytes | None] | None = None,
-) -> None:
-    if not message_group:
-        raise ValueError('`message_group` must not be empty')
-    if replacement_videos is None:
-        replacement_videos = [None] * len(message_group)
-    if len(replacement_videos) != len(message_group):
-        raise ValueError('`replacement_videos` must have the same length as `message_group`')
-
-    if len(message_group) == 1 and message_group[0].video is None:
-        await bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=message_group[0].chat.id,
-            message_id=message_group[0].message_id,
-        )
-        return
-
-    if any(message.video is None for message in message_group):
-        raise ValueError('Message group must contain only videos')
-
-    media = []
-    for message, replacement_video in zip(message_group, replacement_videos, strict=True):
-        video = message.video
-        if video is None:
-            raise ValueError('Message group must contain only videos')
-        media.append(
-            InputMediaVideo(
-                media=(
-                    video.file_id
-                    if replacement_video is None
-                    else BufferedInputFile(
-                        replacement_video,
-                        filename=video.file_name or _telegram_clip_filename(message),
-                    )
-                ),
-                caption=message.caption,
-                caption_entities=message.caption_entities,
-            )
-        )
-
-    await bot.send_media_group(chat_id=chat_id, media=media)
 
 
 def _create_clip_action_button(action: ClipAction) -> InlineKeyboardButton:

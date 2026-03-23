@@ -11,6 +11,7 @@ from aiogram.utils.formatting import Bold, Text
 from general_bot.services.clip_store import Scope, Season, StoreResult, SubSeason, Universe
 
 FLOW_FETCH = 'fetch'
+FLOW_FETCH_RAW = 'fetch_raw'
 FLOW_STORE = 'store'
 BACK_CALLBACK_VALUE = 'back'
 NONE_CALLBACK_VALUE = SubSeason.NONE.value

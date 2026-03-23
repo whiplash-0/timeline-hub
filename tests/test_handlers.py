@@ -11,6 +11,7 @@ import general_bot.handlers.clips_store as clips_store_module
 from general_bot.handlers.clips_common import (
     ALL_SCOPES_CALLBACK_VALUE,
     DUMMY_BUTTON_TEXT,
+    FLOW_FETCH_RAW,
     FetchClipFlow,
     MenuAction,
     MenuStep,
@@ -330,7 +331,7 @@ async def test_on_clips_sends_fetch_entry_button() -> None:
         message_width=settings.message_width,
     )
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Fetch'], [DUMMY_BUTTON_TEXT], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Fetch'], ['Fetch raw'], ['Cancel']]
     assert state.current_state is None
     assert state.clear_count == 1
 
@@ -345,7 +346,7 @@ async def test_on_fetch_entry_edits_to_no_clips_stored_when_empty() -> None:
 
     await on_fetch_entry(
         callback,
-        FetchEntryCallbackData(action=FetchEntryAction.OPEN),
+        FetchEntryCallbackData(action=FetchEntryAction.FETCH),
         services,
         settings,
         state,
@@ -438,8 +439,7 @@ async def test_clip_action_selection_includes_store_button() -> None:
     )
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    _assert_no_dummy_buttons(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Normalize'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], [DUMMY_BUTTON_TEXT], ['Cancel']]
 
 
 @pytest.mark.asyncio
@@ -531,7 +531,7 @@ async def test_on_fetch_entry_opens_year_menu_with_fetch_selected() -> None:
 
     await on_fetch_entry(
         callback,
-        FetchEntryCallbackData(action=FetchEntryAction.OPEN),
+        FetchEntryCallbackData(action=FetchEntryAction.FETCH),
         services,
         _settings(),
         state,
@@ -549,6 +549,37 @@ async def test_on_fetch_entry_opens_year_menu_with_fetch_selected() -> None:
         [DUMMY_BUTTON_TEXT, '2024', '2025'],
         ['Back'],
     ]
+    assert state.current_state == FetchClipFlow.year.state
+
+
+@pytest.mark.asyncio
+async def test_on_fetch_entry_opens_year_menu_with_fetch_raw_selected() -> None:
+    message = _fake_message(text='Select action:', message_id=112)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    services = _services(
+        clip_store=SimpleNamespace(
+            list_groups=AsyncMock(
+                return_value=[
+                    ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+                    ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
+                ]
+            )
+        )
+    )
+
+    await on_fetch_entry(
+        callback,
+        FetchEntryCallbackData(action=FetchEntryAction.FETCH_RAW),
+        services,
+        _settings(),
+        state,
+    )
+
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _selected_kwargs('Fetch raw', prompt='Select year:', message_width=35),
+    )
     assert state.current_state == FetchClipFlow.year.state
 
 
@@ -686,13 +717,13 @@ async def test_fetch_scope_menu_uses_fixed_scope_grid_with_dummy_slots() -> None
 
 
 @pytest.mark.asyncio
-async def test_fetch_scope_all_with_one_scope_sends_single_scope_normally() -> None:
+async def test_fetch_raw_scope_all_with_one_scope_sends_single_scope_normally() -> None:
     message = _fake_message(chat_id=9, message_id=741)
     callback = _fake_callback(message)
     state = _FakeState()
     await state.set_state(FetchClipFlow.scope)
     await state.update_data(
-        mode='fetch',
+        mode=FLOW_FETCH_RAW,
         menu_message_id=741,
         year=2024,
         season=Season.S1,
@@ -718,7 +749,7 @@ async def test_fetch_scope_all_with_one_scope_sends_single_scope_normally() -> N
     callback.answer.assert_awaited_once()
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _selected_kwargs('Fetch', '2024', '1', 'West', 'All'),
+        _selected_kwargs('Fetch raw', '2024', '1', 'West', 'All'),
     )
     assert clip_store.calls == [
         (
@@ -730,6 +761,53 @@ async def test_fetch_scope_all_with_one_scope_sends_single_scope_normally() -> N
         ('video', (9, 'one.mp4')),
         ('message', (9, 'Done')),
     ]
+    assert state.current_state is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_scope_all_normalizes_before_sending(monkeypatch: pytest.MonkeyPatch) -> None:
+    message = _fake_message(chat_id=9, message_id=742)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    await state.set_state(FetchClipFlow.scope)
+    await state.update_data(
+        mode='fetch',
+        menu_message_id=742,
+        year=2024,
+        season=Season.S1,
+        universe=Universe.WEST,
+        sub_season=SubSeason.NONE,
+    )
+    bot = AsyncMock()
+    clip_store = _FetchClipStore(
+        {Scope.COLLECTION: [[Clip(filename='one.mp4', bytes=b'one')]]},
+        sub_groups=[ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)],
+    )
+    services = _services(clip_store=clip_store)
+
+    async def _fake_normalize(video_bytes: bytes, *, loudness: float, bitrate: int) -> bytes:
+        assert loudness == -14
+        assert bitrate == 128
+        return b'normalized:' + video_bytes
+
+    monkeypatch.setattr(clips_fetch_module, 'normalize_audio_loudness', _fake_normalize)
+
+    await on_fetch_menu(
+        callback,
+        FetchCallbackData(action=MenuAction.SELECT, step=MenuStep.SCOPE, value=ALL_SCOPES_CALLBACK_VALUE),
+        bot,
+        services,
+        _settings(),
+        state,
+    )
+
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _selected_kwargs('Fetch', '2024', '1', 'West', 'All'),
+    )
+    assert bot.send_video.await_args.kwargs['video'].filename == 'one.mp4'
+    assert bot.send_video.await_args.kwargs['video'].data == b'normalized:one'
+    bot.send_message.assert_awaited_with(chat_id=9, text='Done')
     assert state.current_state is None
 
 
@@ -1139,6 +1217,8 @@ async def test_send_fetch_scopes_sends_separator_only_between_scope_blocks_and_d
         clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
         sub_season=SubSeason.NONE,
         scopes=[Scope.COLLECTION, Scope.EXTRA],
+        settings=_settings(),
+        normalize_audio=False,
     )
 
     assert services.clip_store.calls == [
@@ -1157,6 +1237,93 @@ async def test_send_fetch_scopes_sends_separator_only_between_scope_blocks_and_d
         ('video', (9, 'two.mp4')),
         ('message', (9, 'Done')),
     ]
+
+
+@pytest.mark.asyncio
+async def test_send_fetch_scopes_normalizes_clips_in_memory_before_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = AsyncMock()
+    clip_store = _FetchClipStore(
+        {
+            Scope.COLLECTION: [
+                [Clip(filename='one.mp4', bytes=b'one')],
+                [
+                    Clip(filename='two.mp4', bytes=b'two'),
+                    Clip(filename='three.mp4', bytes=b'three'),
+                ],
+            ]
+        }
+    )
+    services = _services(clip_store=clip_store)
+
+    async def _fake_normalize(video_bytes: bytes, *, loudness: float, bitrate: int) -> bytes:
+        assert loudness == -13
+        assert bitrate == 160
+        return video_bytes.upper()
+
+    monkeypatch.setattr(clips_fetch_module, 'normalize_audio_loudness', _fake_normalize)
+
+    await _send_fetch_scopes(
+        bot=bot,
+        chat_id=9,
+        services=services,
+        clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+        sub_season=SubSeason.NONE,
+        scopes=[Scope.COLLECTION],
+        settings=_settings(normalization_loudness=-13, normalization_bitrate=160),
+        normalize_audio=True,
+    )
+
+    assert bot.send_video.await_args.kwargs['video'].filename == 'one.mp4'
+    assert bot.send_video.await_args.kwargs['video'].data == b'ONE'
+    sent_media = bot.send_media_group.await_args.kwargs['media']
+    assert [item.media.filename for item in sent_media] == ['two.mp4', 'three.mp4']
+    assert [item.media.data for item in sent_media] == [b'TWO', b'THREE']
+    assert clip_store.batches_by_scope[Scope.COLLECTION] == [
+        [Clip(filename='one.mp4', bytes=b'one')],
+        [
+            Clip(filename='two.mp4', bytes=b'two'),
+            Clip(filename='three.mp4', bytes=b'three'),
+        ],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_fetch_scopes_propagates_normalization_failure_without_sending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = AsyncMock()
+    services = _services(
+        clip_store=_FetchClipStore(
+            {
+                Scope.COLLECTION: [
+                    [Clip(filename='one.mp4', bytes=b'one')],
+                ]
+            }
+        )
+    )
+
+    async def _failing_normalize(video_bytes: bytes, *, loudness: float, bitrate: int) -> bytes:
+        raise RuntimeError(f'boom: {video_bytes!r}')
+
+    monkeypatch.setattr(clips_fetch_module, 'normalize_audio_loudness', _failing_normalize)
+
+    with pytest.raises(RuntimeError, match="boom: b'one'"):
+        await _send_fetch_scopes(
+            bot=bot,
+            chat_id=9,
+            services=services,
+            clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+            sub_season=SubSeason.NONE,
+            scopes=[Scope.COLLECTION],
+            settings=_settings(),
+            normalize_audio=True,
+        )
+
+    bot.send_video.assert_not_awaited()
+    bot.send_media_group.assert_not_awaited()
+    bot.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
