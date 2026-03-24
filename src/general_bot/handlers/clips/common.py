@@ -12,6 +12,7 @@ from general_bot.services.clip_store import Scope, Season, StoreResult, SubSeaso
 
 FLOW_FETCH = 'fetch'
 FLOW_FETCH_RAW = 'fetch_raw'
+FLOW_RECONCILE = 'reconcile'
 FLOW_STORE = 'store'
 BACK_CALLBACK_VALUE = 'back'
 NONE_CALLBACK_VALUE = SubSeason.NONE.value
@@ -51,6 +52,11 @@ class StoreClipFlow(StatesGroup):
     scope = State()
 
 
+class ReconcileClipFlow(StatesGroup):
+    sub_season = State()
+    scope = State()
+
+
 FETCH_STATE_BY_STEP = {
     MenuStep.YEAR: FetchClipFlow.year,
     MenuStep.SEASON: FetchClipFlow.season,
@@ -64,6 +70,10 @@ STORE_STATE_BY_STEP = {
     MenuStep.UNIVERSE: StoreClipFlow.universe,
     MenuStep.SUB_SEASON: StoreClipFlow.sub_season,
     MenuStep.SCOPE: StoreClipFlow.scope,
+}
+RECONCILE_STATE_BY_STEP = {
+    MenuStep.SUB_SEASON: ReconcileClipFlow.sub_season,
+    MenuStep.SCOPE: ReconcileClipFlow.scope,
 }
 
 

@@ -10,16 +10,17 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.formatting import Bold, Text
 from loguru import logger
 
-from general_bot.handlers.clips_common import (
+from general_bot.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
+    FLOW_RECONCILE,
     FLOW_STORE,
+    RECONCILE_STATE_BY_STEP,
     STORE_STATE_BY_STEP,
     MenuAction,
     MenuStep,
     callback_message,
     create_padding_line,
     download_video_bytes,
-    dummy_button,
     format_store_summary,
     handle_stale_selection,
     parse_scope,
@@ -31,7 +32,7 @@ from general_bot.handlers.clips_common import (
     selection_text,
     stacked_keyboard,
 )
-from general_bot.handlers.clips_flow import (
+from general_bot.handlers.clips.flow import (
     FlowMenuDefinition,
     flow_selection_labels,
     scope_option_callback_value,
@@ -50,11 +51,16 @@ from general_bot.services.clip_store import (
     Clip,
     ClipGroup,
     ClipSubGroup,
+    DuplicateFilenamesError,
+    InvalidFilenamesError,
+    MixedClipGroupsError,
+    ReconcileResult,
     Scope,
     Season,
     StoreResult,
     SubSeason,
     Universe,
+    UnknownClipsError,
 )
 from general_bot.services.container import Services
 from general_bot.services.message_buffer import MessageGroup
@@ -65,35 +71,43 @@ router = Router()
 _TELEGRAM_MEDIA_GROUP_LIMIT = 10
 
 
-class ClipAction(StrEnum):
+class IntakeAction(StrEnum):
     CANCEL = auto()
+    RECONCILE = auto()
     STORE = auto()
 
 
-class ClipActionCallbackData(CallbackData, prefix='clip_action'):
-    action: ClipAction
+class IntakeActionCallbackData(CallbackData, prefix='clip_action'):
+    action: IntakeAction
 
 
-class StoreCallbackData(CallbackData, prefix='clip_store'):
+class IntakeCallbackData(CallbackData, prefix='clip_intake'):
     action: MenuAction
     step: MenuStep
     value: str
 
 
-def _pack_store_menu_callback(action: MenuAction, step: MenuStep, value: str) -> str:
-    return StoreCallbackData(action=action, step=step, value=value).pack()
+def _pack_intake_menu_callback(action: MenuAction, step: MenuStep, value: str) -> str:
+    return IntakeCallbackData(action=action, step=step, value=value).pack()
 
 
 _STORE_FLOW = FlowMenuDefinition(
     mode=FLOW_STORE,
     flow_label='Store',
     state_by_step=STORE_STATE_BY_STEP,
-    pack_callback=_pack_store_menu_callback,
+    pack_callback=_pack_intake_menu_callback,
+)
+
+_RECONCILE_FLOW = FlowMenuDefinition(
+    mode=FLOW_RECONCILE,
+    flow_label='Reconcile',
+    state_by_step=RECONCILE_STATE_BY_STEP,
+    pack_callback=_pack_intake_menu_callback,
 )
 
 
 @router.message(F.chat.type == ChatType.PRIVATE)
-async def on_message_buffer_and_schedule_clip_action_selection(
+async def on_buffered_clip_message(
     message: Message,
     services: Services,
     settings: Settings,
@@ -102,7 +116,7 @@ async def on_message_buffer_and_schedule_clip_action_selection(
     services.chat_message_buffer.append(message, chat_id=chat_id)
 
     async def send_clip_action_selection() -> None:
-        kwargs = _clip_action_menu_kwargs(
+        kwargs = _intake_action_menu_kwargs(
             services=services,
             chat_id=chat_id,
             message_width=settings.message_width,
@@ -121,12 +135,12 @@ async def on_message_buffer_and_schedule_clip_action_selection(
 
 
 @router.callback_query(
-    ClipActionCallbackData.filter(),
+    IntakeActionCallbackData.filter(),
     F.message.chat.type == ChatType.PRIVATE,
 )
-async def on_clip_action(
+async def on_intake_action(
     callback: CallbackQuery,
-    callback_data: ClipActionCallbackData,
+    callback_data: IntakeActionCallbackData,
     bot: Bot,
     services: Services,
     settings: Settings,
@@ -139,30 +153,66 @@ async def on_clip_action(
         return
 
     match callback_data.action:
-        case ClipAction.CANCEL:
+        case IntakeAction.CANCEL:
             await state.clear()
             await message.edit_text(
                 **selected_text(selected='Cancel'),
                 reply_markup=None,
             )
             services.chat_message_buffer.flush(message.chat.id)
-            await message.answer('Canceled')
 
-        case ClipAction.STORE:
+        case IntakeAction.RECONCILE:
+            stored_data = await state.get_data()
+            stored_clip_group = _reconcile_clip_group_from_state(stored_data)
+            stored_filename_batches = _reconcile_filename_batches_from_state(stored_data)
+            if stored_clip_group is not None and stored_filename_batches is not None:
+                await _show_reconcile_sub_season_menu(
+                    message=message,
+                    state=state,
+                    settings=settings,
+                    clip_group=stored_clip_group,
+                    filename_batches=stored_filename_batches,
+                )
+                return
+
+            filename_batches = _message_groups_to_filenames(services.chat_message_buffer.peek_grouped(message.chat.id))
+            try:
+                clip_group = await services.clip_store.derive_group(filename_batches)
+            except DuplicateFilenamesError:
+                await message.answer("Can't reconcile duplicates")
+                return
+            except InvalidFilenamesError, UnknownClipsError:
+                await message.answer("Can't reconcile not stored")
+                return
+            except MixedClipGroupsError:
+                await message.answer("Can't reconcile mixed groups")
+                return
+
+            services.chat_message_buffer.flush(message.chat.id)
+            await _show_reconcile_sub_season_menu(
+                message=message,
+                state=state,
+                settings=settings,
+                clip_group=clip_group,
+                filename_batches=filename_batches,
+            )
+
+        case IntakeAction.STORE:
             await _show_store_year_menu(
                 message=message,
                 state=state,
                 settings=settings,
+                flow=_STORE_FLOW,
             )
 
 
 @router.callback_query(
-    StoreCallbackData.filter(),
+    IntakeCallbackData.filter(),
     F.message.chat.type == ChatType.PRIVATE,
 )
-async def on_store_menu(
+async def on_intake_menu(
     callback: CallbackQuery,
-    callback_data: StoreCallbackData,
+    callback_data: IntakeCallbackData,
     bot: Bot,
     services: Services,
     settings: Settings,
@@ -174,10 +224,20 @@ async def on_store_menu(
         await state.clear()
         return
 
+    data = await state.get_data()
+    flow = _selection_flow_for_mode(data.get('mode'))
+    if flow is None:
+        await handle_stale_selection(message=message, state=state)
+        return
+
+    if callback_data.step not in flow.state_by_step:
+        await handle_stale_selection(message=message, state=state)
+        return
+
     if not await validate_menu_flow_state(
         message=message,
         state=state,
-        flow=_STORE_FLOW,
+        flow=flow,
         step=callback_data.step,
     ):
         return
@@ -189,6 +249,7 @@ async def on_store_menu(
             services=services,
             settings=settings,
             step=callback_data.step,
+            flow=flow,
         )
         return
 
@@ -199,6 +260,7 @@ async def on_store_menu(
         settings=settings,
         bot=bot,
         callback_data=callback_data,
+        flow=flow,
     )
 
 
@@ -209,12 +271,44 @@ async def _on_store_back(
     services: Services,
     settings: Settings,
     step: MenuStep,
+    flow: FlowMenuDefinition,
 ) -> None:
     data = await state.get_data()
 
+    if flow is _RECONCILE_FLOW:
+        match step:
+            case MenuStep.SUB_SEASON:
+                filename_batches = _reconcile_filename_batches_from_state(data)
+                if filename_batches is None:
+                    await handle_stale_selection(message=message, state=state)
+                    return
+                await _show_intake_action_menu(
+                    message=message,
+                    state=state,
+                    services=services,
+                    settings=settings,
+                    clip_count_override=_filename_batch_clip_count(filename_batches),
+                    preserve_state=True,
+                )
+
+            case MenuStep.SCOPE:
+                clip_group = _reconcile_clip_group_from_state(data)
+                filename_batches = _reconcile_filename_batches_from_state(data)
+                if clip_group is None or filename_batches is None:
+                    await handle_stale_selection(message=message, state=state)
+                    return
+                await _show_reconcile_sub_season_menu(
+                    message=message,
+                    state=state,
+                    settings=settings,
+                    clip_group=clip_group,
+                    filename_batches=filename_batches,
+                )
+        return
+
     match step:
         case MenuStep.YEAR:
-            await _show_clip_action_menu(
+            await _show_intake_action_menu(
                 message=message,
                 state=state,
                 services=services,
@@ -227,6 +321,7 @@ async def _on_store_back(
                 message=message,
                 state=state,
                 settings=settings,
+                flow=flow,
             )
 
         case MenuStep.UNIVERSE:
@@ -240,6 +335,7 @@ async def _on_store_back(
                 state=state,
                 settings=settings,
                 year=year,
+                flow=flow,
             )
 
         case MenuStep.SUB_SEASON:
@@ -255,6 +351,7 @@ async def _on_store_back(
                 settings=settings,
                 year=year,
                 season=season,
+                flow=flow,
             )
 
         case MenuStep.SCOPE:
@@ -270,6 +367,7 @@ async def _on_store_back(
                 state=state,
                 settings=settings,
                 clip_group=clip_group,
+                flow=flow,
             )
 
 
@@ -280,9 +378,20 @@ async def _on_store_select(
     services: Services,
     settings: Settings,
     bot: Bot,
-    callback_data: StoreCallbackData,
+    callback_data: IntakeCallbackData,
+    flow: FlowMenuDefinition,
 ) -> None:
     data = await state.get_data()
+
+    if flow is _RECONCILE_FLOW:
+        await _on_reconcile_select(
+            message=message,
+            state=state,
+            services=services,
+            settings=settings,
+            callback_data=callback_data,
+        )
+        return
 
     match callback_data.step:
         case MenuStep.YEAR:
@@ -296,6 +405,7 @@ async def _on_store_select(
                 state=state,
                 settings=settings,
                 year=year,
+                flow=flow,
             )
 
         case MenuStep.SEASON:
@@ -311,6 +421,7 @@ async def _on_store_select(
                 settings=settings,
                 year=year,
                 season=season,
+                flow=flow,
             )
 
         case MenuStep.UNIVERSE:
@@ -327,6 +438,7 @@ async def _on_store_select(
                 state=state,
                 settings=settings,
                 clip_group=clip_group,
+                flow=flow,
             )
 
         case MenuStep.SUB_SEASON:
@@ -344,6 +456,7 @@ async def _on_store_select(
                 settings=settings,
                 clip_group=clip_group,
                 sub_season=sub_season,
+                flow=flow,
             )
 
         case MenuStep.SCOPE:
@@ -359,7 +472,7 @@ async def _on_store_select(
             await message.edit_text(
                 **selection_text(
                     selected=flow_selection_labels(
-                        _STORE_FLOW,
+                        flow,
                         year=year,
                         season=season,
                         universe=universe,
@@ -369,32 +482,98 @@ async def _on_store_select(
                 ),
                 reply_markup=None,
             )
+            await state.clear()
 
-            result = await _store_buffered_clips(
-                bot=bot,
-                chat_id=message.chat.id,
-                services=services,
+            if flow is _STORE_FLOW:
+                result = await _store_buffered_clips(
+                    bot=bot,
+                    chat_id=message.chat.id,
+                    services=services,
+                    clip_group=clip_group,
+                    clip_sub_group=clip_sub_group,
+                )
+
+                await message.answer(**_store_summary_kwargs(result))
+
+                if result.stored_count > 0 and scope in {Scope.EXTRA, Scope.SOURCE}:
+                    try:
+                        await services.clip_store.compact(
+                            clip_group=clip_group,
+                            clip_sub_group=clip_sub_group,
+                            batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
+                        )
+                    except Exception:
+                        logger.exception(
+                            'Post-store clip compaction failed for {} {}',
+                            clip_group,
+                            clip_sub_group,
+                        )
+                        raise
+                return
+
+
+async def _on_reconcile_select(
+    *,
+    message: Message,
+    state: FSMContext,
+    services: Services,
+    settings: Settings,
+    callback_data: IntakeCallbackData,
+) -> None:
+    data = await state.get_data()
+    clip_group = _reconcile_clip_group_from_state(data)
+    filename_batches = _reconcile_filename_batches_from_state(data)
+    if clip_group is None or filename_batches is None:
+        await handle_stale_selection(message=message, state=state)
+        return
+
+    match callback_data.step:
+        case MenuStep.SUB_SEASON:
+            sub_season = parse_sub_season(callback_data.value)
+            if not isinstance(sub_season, SubSeason):
+                await handle_stale_selection(message=message, state=state)
+                return
+            await _show_reconcile_scope_menu(
+                message=message,
+                state=state,
+                settings=settings,
+                clip_group=clip_group,
+                sub_season=sub_season,
+                filename_batches=filename_batches,
+            )
+
+        case MenuStep.SCOPE:
+            sub_season = data.get('sub_season')
+            scope = parse_scope(callback_data.value)
+            if not isinstance(sub_season, SubSeason) or scope is None:
+                await handle_stale_selection(message=message, state=state)
+                return
+            clip_sub_group = ClipSubGroup(sub_season=sub_season, scope=scope)
+
+            await message.edit_text(
+                **selection_text(
+                    selected=flow_selection_labels(
+                        _RECONCILE_FLOW,
+                        year=clip_group.year,
+                        season=clip_group.season,
+                        universe=clip_group.universe,
+                        sub_season=sub_season,
+                        scope=scope,
+                    )
+                ),
+                reply_markup=None,
+            )
+            await state.clear()
+
+            result = await services.clip_store.reconcile(
+                filename_batches,
                 clip_group=clip_group,
                 clip_sub_group=clip_sub_group,
             )
+            await message.answer(**_reconcile_summary_kwargs(result))
 
-            await state.clear()
-            await message.answer(**_store_summary_kwargs(result))
-
-            if result.stored_count > 0 and scope in {Scope.EXTRA, Scope.SOURCE}:
-                try:
-                    await services.clip_store.compact(
-                        clip_group=clip_group,
-                        clip_sub_group=clip_sub_group,
-                        batch_size=_TELEGRAM_MEDIA_GROUP_LIMIT,
-                    )
-                except Exception:
-                    logger.exception(
-                        'Post-store clip compaction failed for {} {}',
-                        clip_group,
-                        clip_sub_group,
-                    )
-                    raise
+        case _:
+            await handle_stale_selection(message=message, state=state)
 
 
 async def _show_store_year_menu(
@@ -402,13 +581,14 @@ async def _show_store_year_menu(
     message: Message,
     state: FSMContext,
     settings: Settings,
+    flow: FlowMenuDefinition = _STORE_FLOW,
 ) -> bool:
     years = _store_year_options(current_year=date.today().year, min_year=settings.min_clip_year)
     if not years:
         return False
 
     await show_fixed_option_menu(
-        flow=_STORE_FLOW,
+        flow=flow,
         message=message,
         state=state,
         message_width=settings.message_width,
@@ -428,13 +608,14 @@ async def _show_store_season_menu(
     state: FSMContext,
     settings: Settings,
     year: int,
+    flow: FlowMenuDefinition = _STORE_FLOW,
 ) -> bool:
     if year not in _store_year_options(current_year=date.today().year, min_year=settings.min_clip_year):
         return False
     seasons = _store_season_options(year=year, today=date.today())
 
     await show_fixed_option_menu(
-        flow=_STORE_FLOW,
+        flow=flow,
         message=message,
         state=state,
         message_width=settings.message_width,
@@ -456,9 +637,10 @@ async def _show_store_universe_menu(
     settings: Settings,
     year: int,
     season: Season,
+    flow: FlowMenuDefinition = _STORE_FLOW,
 ) -> bool:
     await show_fixed_option_menu(
-        flow=_STORE_FLOW,
+        flow=flow,
         message=message,
         state=state,
         message_width=settings.message_width,
@@ -480,9 +662,10 @@ async def _show_store_sub_season_menu(
     state: FSMContext,
     settings: Settings,
     clip_group: ClipGroup,
+    flow: FlowMenuDefinition = _STORE_FLOW,
 ) -> bool:
     await show_fixed_option_menu(
-        flow=_STORE_FLOW,
+        flow=flow,
         message=message,
         state=state,
         message_width=settings.message_width,
@@ -506,9 +689,10 @@ async def _show_store_scope_menu(
     settings: Settings,
     clip_group: ClipGroup,
     sub_season: SubSeason,
+    flow: FlowMenuDefinition = _STORE_FLOW,
 ) -> bool:
     await show_fixed_option_menu(
-        flow=_STORE_FLOW,
+        flow=flow,
         message=message,
         state=state,
         message_width=settings.message_width,
@@ -524,6 +708,50 @@ async def _show_store_scope_menu(
         option_text=scope_option_text,
     )
     return True
+
+
+async def _show_reconcile_sub_season_menu(
+    *,
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    clip_group: ClipGroup,
+    filename_batches: list[list[str]],
+) -> None:
+    await _show_store_sub_season_menu(
+        message=message,
+        state=state,
+        settings=settings,
+        clip_group=clip_group,
+        flow=_RECONCILE_FLOW,
+    )
+    await state.update_data(
+        clip_group=clip_group,
+        filename_batches=filename_batches,
+    )
+
+
+async def _show_reconcile_scope_menu(
+    *,
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    clip_group: ClipGroup,
+    sub_season: SubSeason,
+    filename_batches: list[list[str]],
+) -> None:
+    await _show_store_scope_menu(
+        message=message,
+        state=state,
+        settings=settings,
+        clip_group=clip_group,
+        sub_season=sub_season,
+        flow=_RECONCILE_FLOW,
+    )
+    await state.update_data(
+        clip_group=clip_group,
+        filename_batches=filename_batches,
+    )
 
 
 async def _store_buffered_clips(
@@ -570,6 +798,21 @@ async def _message_group_to_clips(
     return clips
 
 
+def _message_group_to_filenames(message_group: MessageGroup) -> list[str]:
+    filenames: list[str] = []
+    for message in message_group:
+        if message.video is None:
+            continue
+        if not message.video.file_name:
+            raise ValueError('Reconcile requires every buffered video to have a filename')
+        filenames.append(message.video.file_name)
+    return filenames
+
+
+def _message_groups_to_filenames(message_groups: list[MessageGroup]) -> list[list[str]]:
+    return [filenames for message_group in message_groups if (filenames := _message_group_to_filenames(message_group))]
+
+
 def _store_year_options(*, current_year: int, min_year: int) -> list[int]:
     return year_option_universe(current_year=current_year, min_year=min_year)
 
@@ -584,13 +827,18 @@ def _telegram_clip_filename(message: Message) -> str:
     return f'telegram-{message.chat.id}-{message.message_id}.mp4'
 
 
-def _clip_action_menu_kwargs(
+def _intake_action_menu_kwargs(
     *,
     services: Services,
     chat_id: ChatId,
     message_width: int,
+    clip_count_override: int | None = None,
 ) -> dict[str, Any] | None:
-    clip_count = len([message for message in services.chat_message_buffer.peek(chat_id) if message.video is not None])
+    clip_count = clip_count_override
+    if clip_count is None:
+        clip_count = len(
+            [message for message in services.chat_message_buffer.peek(chat_id) if message.video is not None]
+        )
     if clip_count == 0:
         return None
     return {
@@ -604,26 +852,32 @@ def _clip_action_menu_kwargs(
         ).as_kwargs(),
         'reply_markup': stacked_keyboard(
             buttons=[
-                _create_clip_action_button(ClipAction.STORE),
-                dummy_button(),
-                _create_clip_action_button(ClipAction.CANCEL),
+                _create_intake_action_button(IntakeAction.STORE),
+                _create_intake_action_button(IntakeAction.RECONCILE),
+                _create_intake_action_button(IntakeAction.CANCEL),
             ]
         ),
     }
 
 
-async def _show_clip_action_menu(
+async def _show_intake_action_menu(
     *,
     message: Message,
     state: FSMContext,
     services: Services,
     settings: Settings,
+    clip_count_override: int | None = None,
+    preserve_state: bool = False,
 ) -> None:
-    await state.clear()
-    kwargs = _clip_action_menu_kwargs(
+    if preserve_state:
+        await state.set_state(None)
+    else:
+        await state.clear()
+    kwargs = _intake_action_menu_kwargs(
         services=services,
         chat_id=message.chat.id,
         message_width=settings.message_width,
+        clip_count_override=clip_count_override,
     )
     if kwargs is None:
         await message.edit_text('No clips received', reply_markup=None)
@@ -631,10 +885,10 @@ async def _show_clip_action_menu(
     await message.edit_text(**kwargs)
 
 
-def _create_clip_action_button(action: ClipAction) -> InlineKeyboardButton:
+def _create_intake_action_button(action: IntakeAction) -> InlineKeyboardButton:
     return InlineKeyboardButton(
         text=action.title(),
-        callback_data=ClipActionCallbackData(action=action).pack(),
+        callback_data=IntakeActionCallbackData(action=action).pack(),
     )
 
 
@@ -650,3 +904,58 @@ def _store_summary_kwargs(result: StoreResult) -> dict[str, Any]:
         label, value = line.split(': ', maxsplit=1)
         parts.extend([f'{label}: ', Bold(value)])
     return Text(*parts).as_kwargs()
+
+
+def _reconcile_summary_kwargs(result: ReconcileResult) -> dict[str, Any]:
+    if result.updated == 0 and result.removed == 0:
+        return {'text': 'Nothing changed'}
+
+    parts: list[object] = []
+
+    if result.updated > 0:
+        parts.extend(['Updated: ', Bold(str(result.updated))])
+
+    if result.removed > 0:
+        if parts:
+            parts.append('\n')
+        parts.extend(['Removed: ', Bold(str(result.removed))])
+
+    return Text(*parts).as_kwargs()
+
+
+def _selection_flow_for_mode(mode: object) -> FlowMenuDefinition | None:
+    if mode == _STORE_FLOW.mode:
+        return _STORE_FLOW
+    if mode == _RECONCILE_FLOW.mode:
+        return _RECONCILE_FLOW
+    return None
+
+
+def _reconcile_clip_group_from_state(data: dict[str, object]) -> ClipGroup | None:
+    clip_group = data.get('clip_group')
+    if isinstance(clip_group, ClipGroup):
+        return clip_group
+    return None
+
+
+def _reconcile_filename_batches_from_state(data: dict[str, object]) -> list[list[str]] | None:
+    filename_batches = data.get('filename_batches')
+    if not isinstance(filename_batches, list):
+        return None
+
+    normalized_batches: list[list[str]] = []
+    for batch in filename_batches:
+        if not isinstance(batch, list):
+            return None
+        normalized_batch: list[str] = []
+        for filename in batch:
+            if not isinstance(filename, str):
+                return None
+            normalized_batch.append(filename)
+        normalized_batches.append(normalized_batch)
+
+    return normalized_batches
+
+
+def _filename_batch_clip_count(filename_batches: list[list[str]]) -> int:
+    return sum(len(batch) for batch in filename_batches)

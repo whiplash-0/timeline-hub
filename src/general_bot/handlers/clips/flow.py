@@ -7,7 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
 from aiogram.types import InlineKeyboardButton, Message
 
-from general_bot.handlers.clips_common import (
+from general_bot.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
     BACK_CALLBACK_VALUE,
     UNSET,

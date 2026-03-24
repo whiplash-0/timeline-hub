@@ -8,7 +8,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InputMediaVideo, Message
 
-from general_bot.handlers.clips_common import (
+from general_bot.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
     FETCH_STATE_BY_STEP,
     FLOW_FETCH,
@@ -29,7 +29,7 @@ from general_bot.handlers.clips_common import (
     terminate_menu,
     width_reserved_text,
 )
-from general_bot.handlers.clips_flow import (
+from general_bot.handlers.clips.flow import (
     FlowMenuDefinition,
     available_group_seasons,
     available_group_universes,

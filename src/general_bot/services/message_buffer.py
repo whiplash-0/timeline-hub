@@ -29,6 +29,10 @@ class ChatMessageBuffer:
     def peek(self, chat_id: ChatId) -> Messages:
         return list(self._messages.get(chat_id, []))
 
+    def peek_grouped(self, chat_id: ChatId) -> MessageGroups:
+        """Peek and group messages by contiguous `media_group_id`."""
+        return self._group(self.peek(chat_id))
+
     def flush(self, chat_id: ChatId) -> Messages:
         return self._messages.pop(chat_id, [])
 
