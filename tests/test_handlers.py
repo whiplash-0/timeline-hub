@@ -26,6 +26,8 @@ from general_bot.handlers.clips.common import (
 from general_bot.handlers.clips.intake import (
     IntakeAction,
     IntakeCallbackData,
+    ReorderCallbackData,
+    ReorderClipFlow,
     _reconcile_summary_kwargs,
     _show_store_scope_menu,
     _show_store_season_menu,
@@ -35,6 +37,7 @@ from general_bot.handlers.clips.intake import (
     on_buffered_clip_message,
     on_intake_action,
     on_intake_menu,
+    on_reorder_menu,
     parse_route_text,
 )
 from general_bot.handlers.clips.retrieve import (
@@ -121,10 +124,10 @@ class _RecordingBot:
         self.events.append(('message', (chat_id, text)))
 
     async def send_video(self, *, chat_id: int, video) -> None:
-        self.events.append(('video', (chat_id, video.filename)))
+        self.events.append(('video', (chat_id, getattr(video, 'filename', video))))
 
     async def send_media_group(self, *, chat_id: int, media) -> None:
-        self.events.append(('media_group', (chat_id, [item.media.filename for item in media])))
+        self.events.append(('media_group', (chat_id, [getattr(item.media, 'filename', item.media) for item in media])))
 
 
 class _RetrieveClipStore:
@@ -245,6 +248,33 @@ def _selected_kwargs(*values: str, prompt: str | None = None, message_width: int
         if index > 0:
             parts.append(' → ')
         parts.append(Bold(value))
+
+    selected = Text(*parts)
+    if prompt is None:
+        return selected.as_kwargs()
+    if message_width is None:
+        raise ValueError('`message_width` is required when `prompt` is provided')
+    return Text(
+        selected,
+        '\n',
+        create_padding_line(message_width),
+        '\n',
+        prompt,
+    ).as_kwargs()
+
+
+def _reorder_selected_kwargs(
+    *values: str | int,
+    prompt: str | None = None,
+    message_width: int | None = None,
+) -> dict[str, object]:
+    parts: list[object] = ['Selected: ', Bold('Reorder')]
+    if values:
+        parts.append(' -> ')
+        for index, value in enumerate(values):
+            if index > 0:
+                parts.append(' ')
+            parts.append(Bold(str(value)))
 
     selected = Text(*parts)
     if prompt is None:
@@ -496,7 +526,464 @@ async def test_clip_action_selection_includes_store_button() -> None:
     )
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Route', 'Reconcile'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Reconcile', 'Reorder'], ['Route', 'Store'], ['Cancel']]
+
+
+@pytest.mark.asyncio
+async def test_reorder_action_opens_selection_menu_without_flushing_buffer() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=79)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    for buffered_message in [
+        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        _fake_message(chat_id=77, message_id=2, text='ignore me'),
+        _fake_message(chat_id=77, message_id=3, video=_fake_video(file_id='f2', file_name='two.mp4')),
+        _fake_message(chat_id=77, message_id=4, video=_fake_video(file_id='f3', file_name='three.mp4')),
+        _fake_message(chat_id=77, message_id=5, video=_fake_video(file_id='f4', file_name='four.mp4')),
+        _fake_message(chat_id=77, message_id=6, video=_fake_video(file_id='f5', file_name='five.mp4')),
+    ]:
+        buffer.append(buffered_message, chat_id=77)
+    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+    settings = _settings()
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.REORDER),
+        AsyncMock(),
+        services,
+        settings,
+        state,
+    )
+
+    callback.answer.assert_awaited_once()
+    buffer.flush_grouped.assert_not_called()
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _reorder_selected_kwargs(prompt='Select new order:', message_width=settings.message_width),
+    )
+    reply_markup = message.edit_text.await_args.kwargs['reply_markup']
+    assert _keyboard_rows(reply_markup) == [['5', '3', '1'], [DUMMY_BUTTON_TEXT, '4', '2'], ['Back']]
+    assert state.current_state == ReorderClipFlow.selecting.state
+    assert state.data['buffer_version'] == services.chat_message_buffer.version(77)
+    assert state.data['selected_order'] == []
+    assert state.data['total_clips'] == 5
+    assert [message.message_id for message in services.chat_message_buffer.peek(77)] == [1, 2, 3, 4, 5, 6]
+
+
+@pytest.mark.asyncio
+async def test_reorder_action_rejects_single_clip_and_flushes_buffer() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=80)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        chat_id=77,
+    )
+    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.REORDER),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    buffer.flush_grouped.assert_called_once_with(77)
+    message.edit_text.assert_awaited_once_with('Unexpected number of clips', reply_markup=None)
+    assert services.chat_message_buffer.peek(77) == []
+
+
+@pytest.mark.asyncio
+async def test_reorder_action_rejects_too_many_clips_and_flushes_buffer() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=81)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    for index in range(1, 18):
+        buffer.append(
+            _fake_message(
+                chat_id=77,
+                message_id=index,
+                video=_fake_video(file_id=f'f{index}', file_name=f'{index}.mp4'),
+            ),
+            chat_id=77,
+        )
+    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.REORDER),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    buffer.flush_grouped.assert_called_once_with(77)
+    message.edit_text.assert_awaited_once_with('Too many clips', reply_markup=None)
+    assert services.chat_message_buffer.peek(77) == []
+
+
+@pytest.mark.asyncio
+async def test_reorder_selection_duplicate_click_keeps_state_and_ui() -> None:
+    message = _fake_message(text='Select new order:', chat_id=77, message_id=82)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    await state.set_state(ReorderClipFlow.selecting)
+    await state.update_data(
+        mode='reorder',
+        menu_message_id=82,
+        buffer_version=0,
+        selected_order=[3],
+        total_clips=5,
+    )
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_reorder_menu(
+        callback,
+        ReorderCallbackData(action=MenuAction.SELECT, value='3'),
+        _RecordingBot(),
+        services,
+        _settings(),
+        state,
+    )
+
+    callback.answer.assert_awaited_once()
+    message.edit_text.assert_not_awaited()
+    assert state.data['selected_order'] == [3]
+
+
+@pytest.mark.asyncio
+async def test_reorder_selection_marks_clicked_button_as_primary() -> None:
+    message = _fake_message(text='Select new order:', chat_id=77, message_id=86)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    for index in range(1, 6):
+        buffer.append(
+            _fake_message(
+                chat_id=77,
+                message_id=index,
+                video=_fake_video(file_id=f'f{index}', file_name=f'{index}.mp4'),
+            ),
+            chat_id=77,
+        )
+    await state.set_state(ReorderClipFlow.selecting)
+    await state.update_data(
+        mode='reorder',
+        menu_message_id=86,
+        buffer_version=buffer.version(77),
+        selected_order=[],
+        total_clips=5,
+    )
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_reorder_menu(
+        callback,
+        ReorderCallbackData(action=MenuAction.SELECT, value='3'),
+        _RecordingBot(),
+        services,
+        _settings(),
+        state,
+    )
+
+    reply_markup = message.edit_text.await_args.kwargs['reply_markup']
+    button_by_text = {button.text: button for row in reply_markup.inline_keyboard for button in row}
+    assert _keyboard_rows(reply_markup) == [['5', '3', '1'], [DUMMY_BUTTON_TEXT, '4', '2'], ['Reset']]
+    assert button_by_text['3'].style == 'primary'
+    assert button_by_text['5'].style is None
+
+
+@pytest.mark.asyncio
+async def test_reorder_reset_clears_selection_and_restores_back_button() -> None:
+    message = _fake_message(text='Select new order:', chat_id=77, message_id=87)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    for index in range(1, 6):
+        buffer.append(
+            _fake_message(
+                chat_id=77,
+                message_id=index,
+                video=_fake_video(file_id=f'f{index}', file_name=f'{index}.mp4'),
+            ),
+            chat_id=77,
+        )
+    await state.set_state(ReorderClipFlow.selecting)
+    await state.update_data(
+        mode='reorder',
+        menu_message_id=87,
+        buffer_version=buffer.version(77),
+        selected_order=[3, 5],
+        total_clips=5,
+    )
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+    settings = _settings()
+
+    await on_reorder_menu(
+        callback,
+        ReorderCallbackData(action=MenuAction.BACK, value='reset'),
+        _RecordingBot(),
+        services,
+        settings,
+        state,
+    )
+
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _reorder_selected_kwargs(prompt='Select new order:', message_width=settings.message_width),
+    )
+    reply_markup = message.edit_text.await_args.kwargs['reply_markup']
+    assert _keyboard_rows(reply_markup) == [['5', '3', '1'], [DUMMY_BUTTON_TEXT, '4', '2'], ['Back']]
+    assert all(button.style is None for row in reply_markup.inline_keyboard for button in row if button.text != 'Back')
+    assert state.current_state == ReorderClipFlow.selecting.state
+    assert state.data['selected_order'] == []
+    assert state.data['buffer_version'] == buffer.version(77)
+    assert state.data['total_clips'] == 5
+    assert [message.message_id for message in services.chat_message_buffer.peek(77)] == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_reorder_odd_layout_places_buttons_by_descending_columns() -> None:
+    message = _fake_message(text='Select new order:', chat_id=77, message_id=89)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    for index in range(1, 8):
+        buffer.append(
+            _fake_message(
+                chat_id=77,
+                message_id=index,
+                video=_fake_video(file_id=f'f{index}', file_name=f'{index}.mp4'),
+            ),
+            chat_id=77,
+        )
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.REORDER),
+        AsyncMock(),
+        services,
+        _settings(),
+        state,
+    )
+
+    reply_markup = message.edit_text.await_args.kwargs['reply_markup']
+    assert _keyboard_rows(reply_markup) == [['7', '5', '3', '1'], [DUMMY_BUTTON_TEXT, '6', '4', '2'], ['Back']]
+
+
+@pytest.mark.asyncio
+async def test_reorder_back_from_empty_state_returns_to_intake_action_menu() -> None:
+    message = _fake_message(text='Select new order:', chat_id=77, message_id=88)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    for index in range(1, 6):
+        buffer.append(
+            _fake_message(
+                chat_id=77,
+                message_id=index,
+                video=_fake_video(file_id=f'f{index}', file_name=f'{index}.mp4'),
+            ),
+            chat_id=77,
+        )
+    await state.set_state(ReorderClipFlow.selecting)
+    await state.update_data(
+        mode='reorder',
+        menu_message_id=88,
+        buffer_version=buffer.version(77),
+        selected_order=[],
+        total_clips=5,
+    )
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_reorder_menu(
+        callback,
+        ReorderCallbackData(action=MenuAction.BACK, value='back'),
+        _RecordingBot(),
+        services,
+        _settings(),
+        state,
+    )
+
+    reply_markup = message.edit_text.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [['Reconcile', 'Reorder'], ['Route', 'Store'], ['Cancel']]
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        Text(
+            'Clips: ',
+            Bold('5'),
+            '\n',
+            create_padding_line(35),
+            '\n',
+            'Select action:',
+        ).as_kwargs(),
+    )
+    assert state.current_state is None
+
+
+@pytest.mark.asyncio
+async def test_reorder_selection_becomes_stale_when_buffer_changes() -> None:
+    message = _fake_message(text='Select new order:', chat_id=77, message_id=83)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        chat_id=77,
+    )
+    buffer.append(
+        _fake_message(chat_id=77, message_id=2, video=_fake_video(file_id='f2', file_name='two.mp4')),
+        chat_id=77,
+    )
+    await state.set_state(ReorderClipFlow.selecting)
+    await state.update_data(
+        mode='reorder',
+        menu_message_id=83,
+        buffer_version=buffer.version(77),
+        selected_order=[],
+        total_clips=2,
+    )
+    buffer.append(
+        _fake_message(chat_id=77, message_id=3, video=_fake_video(file_id='f3', file_name='three.mp4')),
+        chat_id=77,
+    )
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_reorder_menu(
+        callback,
+        ReorderCallbackData(action=MenuAction.SELECT, value='1'),
+        _RecordingBot(),
+        services,
+        _settings(),
+        state,
+    )
+
+    message.edit_text.assert_awaited_once_with('Selection is no longer available', reply_markup=None)
+    assert [message.message_id for message in services.chat_message_buffer.peek(77)] == [1, 2, 3]
+    assert state.current_state is None
+
+
+@pytest.mark.asyncio
+async def test_reorder_flow_resends_videos_by_file_id_in_selected_order() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=84)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    for buffered_message in [
+        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        _fake_message(chat_id=77, message_id=2, text='ignore me'),
+        _fake_message(chat_id=77, message_id=3, video=_fake_video(file_id='f2', file_name='two.mp4')),
+        _fake_message(chat_id=77, message_id=4, video=_fake_video(file_id='f3', file_name='three.mp4')),
+        _fake_message(chat_id=77, message_id=5, video=_fake_video(file_id='f4', file_name='four.mp4')),
+        _fake_message(chat_id=77, message_id=6, video=_fake_video(file_id='f5', file_name='five.mp4')),
+    ]:
+        buffer.append(buffered_message, chat_id=77)
+    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+    bot = _RecordingBot()
+    settings = _settings()
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.REORDER),
+        bot,
+        services,
+        settings,
+        state,
+    )
+
+    first_edit = message.edit_text.await_args_list[-1].kwargs
+    _assert_format_kwargs(
+        first_edit,
+        _reorder_selected_kwargs(prompt='Select new order:', message_width=settings.message_width),
+    )
+    buffer.flush_grouped.assert_not_called()
+
+    for value in ['3', '5', '4', '1', '2']:
+        await on_reorder_menu(
+            callback,
+            ReorderCallbackData(action=MenuAction.SELECT, value=value),
+            bot,
+            services,
+            settings,
+            state,
+        )
+
+    assert state.current_state is None
+    assert state.data == {}
+    buffer.flush_grouped.assert_called_once_with(77)
+    assert message.edit_text.await_args_list[-1].kwargs == {
+        **_reorder_selected_kwargs(3, 5, 4, 1, 2),
+        'reply_markup': None,
+    }
+    assert bot.events == [('media_group', (77, ['f3', 'f5', 'f4', 'f1', 'f2']))]
+
+
+@pytest.mark.asyncio
+async def test_reorder_completion_flushes_only_at_completion_and_splits_large_resend() -> None:
+    message = _fake_message(text='Select action:', chat_id=77, message_id=85)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    for index in range(1, 13):
+        buffer.append(
+            _fake_message(
+                chat_id=77,
+                message_id=index,
+                video=_fake_video(file_id=f'f{index}', file_name=f'{index}.mp4'),
+            ),
+            chat_id=77,
+        )
+    buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+    bot = _RecordingBot()
+    settings = _settings()
+
+    await on_intake_action(
+        callback,
+        SimpleNamespace(action=IntakeAction.REORDER),
+        bot,
+        services,
+        settings,
+        state,
+    )
+
+    for value in ['12', '11', '10', '9', '8', '7', '6', '5', '4', '3', '2']:
+        await on_reorder_menu(
+            callback,
+            ReorderCallbackData(action=MenuAction.SELECT, value=value),
+            bot,
+            services,
+            settings,
+            state,
+        )
+        assert buffer.flush_grouped.call_count == 0
+
+    await on_reorder_menu(
+        callback,
+        ReorderCallbackData(action=MenuAction.SELECT, value='1'),
+        bot,
+        services,
+        settings,
+        state,
+    )
+
+    buffer.flush_grouped.assert_called_once_with(77)
+    assert bot.events == [
+        ('media_group', (77, ['f12', 'f11', 'f10', 'f9', 'f8', 'f7', 'f6', 'f5', 'f4', 'f3'])),
+        ('media_group', (77, ['f2', 'f1'])),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1320,7 +1807,7 @@ async def test_reconcile_back_from_sub_season_returns_to_clip_action_menu() -> N
 
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Route', 'Reconcile'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Reconcile', 'Reorder'], ['Route', 'Store'], ['Cancel']]
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
         Text(
