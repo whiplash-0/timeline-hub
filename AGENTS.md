@@ -19,6 +19,115 @@ This allows the user to build strong spatial memory and interact very quickly wi
 
 ---
 
+### Intake action invariants
+
+All intake actions (Store, Route, Reconcile, Reorder) follow a single unified model.
+
+Core rules:
+
+- Intake actions operate on the buffered messages in the chat.
+- Messages may be grouped internally but are processed according to action semantics.
+- Actions are classified into:
+  - **single-shot actions** (flush on entry), or
+  - **interactive actions** (multi-step, no flush on entry).
+
+Single-shot actions:
+- Behavior:
+  - buffer is flushed immediately on entry
+  - validation happens after flush
+  - buffer is NOT restored on failure
+  - this is intentional (stateless UI)
+  - user must resend clips if needed
+
+Interactive actions:
+- Examples: Reorder, Reconcile
+- Behavior:
+  - buffer is NOT flushed on entry
+  - uses buffer versioning for consistency
+  - invalidates interaction if buffer changes
+  - flush happens only on final execution
+
+---
+
+### Validation invariants
+
+Validation must always happen before execution.
+
+Rules:
+
+- No downloads before validation completes
+- No `store()` calls before validation completes
+- No partial execution is allowed
+
+On validation failure:
+
+- return a single generic error message
+- do not perform any side effects
+- do not partially process input
+
+Validation must be:
+
+- deterministic
+- global (entire input considered)
+- consistent with Fetch logic where applicable
+
+---
+
+### Ordering invariants
+
+Message order is authoritative.
+
+Rules:
+
+- Original message order must be preserved unless explicitly changed by the user
+- Any transformation (e.g. Route batching) must maintain relative order
+- `store()` input order must exactly match original message order
+
+Reorder action:
+
+- defines a new explicit order via user input
+- final output must strictly follow selected order
+
+---
+
+### Interaction invariants
+
+Interactive flows must be consistent and safe.
+
+Rules:
+
+- All interactions depend on buffer version
+- Any version mismatch invalidates interaction
+- On invalidation:
+  - remove buttons
+  - show: `Selection is no longer available`
+
+Back behavior:
+
+- Back always resets local interaction state
+- Back never partially reverts state
+- Back returns to the main action menu
+
+---
+
+### Media handling invariants
+
+Media groups are treated as transport-level detail only.
+
+Rules:
+
+- Input:
+  - flatten all video messages
+  - ignore original media group boundaries
+
+- Output:
+  - reconstruct dense media groups
+  - max 10 items per group (Telegram constraint)
+
+- Actions operate on logical clip sequences, not Telegram grouping
+
+---
+
 ### Text layout
 
 Only real text lines represent content. Padding lines are artificial and exist purely for layout stability.
