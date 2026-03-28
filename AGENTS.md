@@ -313,6 +313,8 @@ Subject rules:
 - system-level wording
 - avoid vague or low-signal subjects
 - implementation details belong in the body, not the subject
+- when updating `AGENTS.md`, name the affected agent rules or behavior explicitly
+- avoid vague terms like `guidance`, `cleanup`, or `tweaks` when the change affects agent instructions or decision rules
 
 User-facing concepts in subjects:
 - prefer neutral lowercase phrasing by default
@@ -321,9 +323,11 @@ User-facing concepts in subjects:
 
 Prefer:
 - `refactor(handlers): rename fetch flows to get and pull`
+- `docs: clarify agent commit scope rules`
 
 Over:
 - `refactor(handlers): rename \`Fetch\` flows to \`Get\` and \`Pull\``
+- `docs: clarify commit scope guidance`
 
 Backticks remain acceptable in bodies for precise code entities.
 
@@ -364,6 +368,8 @@ Scopes:
 - valid scopes: `app`, `handlers`, `services`, `infra`, `settings`, `deps`
 - omit scope when the change is cross-cutting or repository-level
 - choose scope by system intent, not just touched file
+- do not use a narrow scope when the change modifies contracts or behavior across multiple subsystems
+- if handlers orchestration depends on new services/domain contracts, usually omit scope
 
 Root-level files usually omit scope.
 
