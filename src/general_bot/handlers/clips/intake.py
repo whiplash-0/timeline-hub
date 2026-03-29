@@ -1151,24 +1151,32 @@ def _plan_route_batches(
 
     for message_group in message_groups:
         for message in message_group:
-            # Route intentionally operates on video-only input. Mixed-media albums
-            # are not supported here, so non-video messages never provide route
-            # context and are skipped on purpose.
             if message.video is None:
+                if message.text is None:
+                    continue
+
+                parsed_route = _parse_and_validate_route(
+                    message.text,
+                    today=today,
+                    allowed_years=allowed_years,
+                )
+                if parsed_route is None:
+                    continue
+                current_route = parsed_route
                 continue
 
-            caption = message.caption
-            if caption is None:
+            route_text = message.caption if message.caption is not None else message.text
+            if route_text is None:
                 if current_route is None:
                     return [], 'Missing route text'
                 next_route = current_route
             else:
-                next_route = parse_route_text(caption)
+                next_route = _parse_and_validate_route(
+                    route_text,
+                    today=today,
+                    allowed_years=allowed_years,
+                )
                 if next_route is None:
-                    return [], 'Invalid route text'
-                if next_route.year not in allowed_years:
-                    return [], 'Invalid route text'
-                if next_route.season not in store_allowed_seasons(year=next_route.year, today=today):
                     return [], 'Invalid route text'
 
             if not batches or batches[-1].clip_group != next_route:
@@ -1178,6 +1186,22 @@ def _plan_route_batches(
             current_route = next_route
 
     return batches, None
+
+
+def _parse_and_validate_route(
+    text: str,
+    *,
+    today: date,
+    allowed_years: set[int],
+) -> ClipGroup | None:
+    parsed_route = parse_route_text(text)
+    if parsed_route is None:
+        return None
+    if parsed_route.year not in allowed_years:
+        return None
+    if parsed_route.season not in store_allowed_seasons(year=parsed_route.year, today=today):
+        return None
+    return parsed_route
 
 
 async def _store_route_batches(
