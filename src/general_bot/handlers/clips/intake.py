@@ -79,6 +79,7 @@ from general_bot.types import ChatId
 
 router = Router()
 _TELEGRAM_MEDIA_GROUP_LIMIT = 10
+_ROUTE_STORE_CHUNK_SIZE = 8
 _BUFFER_VERSION_KEY = 'buffer_version'
 _REORDER_FLOW_MODE = 'reorder'
 _PRODUCE_FLOW_MODE = 'produce'
@@ -1223,16 +1224,24 @@ async def _store_route_batches(
     clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE)
 
     for route_batch in route_batches:
-        batch_result = await services.clip_store.store(
-            await _video_messages_to_clips(bot=bot, messages=route_batch.messages),
-            clip_group=route_batch.clip_group,
-            clip_sub_group=clip_sub_group,
-        )
-        result += batch_result
+        stored_any = False
+        for start in range(0, len(route_batch.messages), _ROUTE_STORE_CHUNK_SIZE):
+            batch_result = await services.clip_store.store(
+                await _video_messages_to_clips(
+                    bot=bot,
+                    messages=route_batch.messages[start : start + _ROUTE_STORE_CHUNK_SIZE],
+                ),
+                clip_group=route_batch.clip_group,
+                clip_sub_group=clip_sub_group,
+            )
+            result += batch_result
+            if batch_result.stored_count > 0:
+                stored_any = True
+
         selection_groups.append(route_batch.clip_group)
         if on_batch_stored is not None:
             await on_batch_stored(selection_groups)
-        if batch_result.stored_count > 0 and route_batch.clip_group not in compact_group_set:
+        if stored_any and route_batch.clip_group not in compact_group_set:
             compact_groups.append(route_batch.clip_group)
             compact_group_set.add(route_batch.clip_group)
 
@@ -1276,8 +1285,8 @@ async def _video_messages_to_clips(
             bytes=await download_video_bytes(bot, file_id=message.video.file_id),
         )
 
-    # This personal bot assumes route segments stay practically small
-    # (roughly tens of clips), so downloading a whole segment at once is fine.
+    # Route storage slices large route groups before calling this helper,
+    # so downloads remain concurrent while each store() call stays bounded.
     # `gather()` preserves input order, which keeps the stored clip order aligned
     # with the original buffered message order.
     return list(await asyncio.gather(*(to_clip(message) for message in messages)))
