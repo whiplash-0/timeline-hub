@@ -26,23 +26,21 @@ from general_bot.handlers.clips.common import (
     selected_text,
     selection_text,
     stacked_keyboard,
-    terminate_menu,
     width_reserved_text,
 )
 from general_bot.handlers.clips.flow import (
     FlowMenuDefinition,
     available_group_seasons,
-    available_group_universes,
     available_group_years,
     available_scopes,
     available_sub_seasons,
     flow_selection_labels,
     scope_option_callback_value,
     scope_option_text,
-    selected_year,
-    selected_year_season,
-    selected_year_season_universe,
-    selected_year_season_universe_sub_season,
+    selected_universe,
+    selected_universe_year,
+    selected_universe_year_season,
+    selected_universe_year_season_sub_season,
     show_fixed_option_menu,
     show_or_stale,
     store_allowed_seasons,
@@ -145,20 +143,12 @@ async def on_retrieve_entry(
         return
 
     groups = await services.clip_store.list_groups()
-    if not groups:
-        await terminate_menu(
-            message=message,
-            state=state,
-            text='No clips stored',
-        )
-        return
-
-    await _show_retrieve_year_menu(
+    await state.update_data(groups=groups)
+    await _show_retrieve_universe_menu(
         message=message,
         state=state,
         settings=settings,
         flow=flow,
-        groups=groups,
     )
 
 
@@ -226,60 +216,63 @@ async def _on_retrieve_back(
     flow: FlowMenuDefinition,
 ) -> None:
     data = await state.get_data()
+    groups = data.get('groups')
+    if not isinstance(groups, list):
+        await handle_stale_selection(message=message, state=state)
+        return
 
     match step:
-        case MenuStep.YEAR:
+        case MenuStep.UNIVERSE:
             await _show_retrieve_entry_menu(message=message, state=state, settings=settings)
 
+        case MenuStep.YEAR:
+            await show_or_stale(
+                show_menu=_show_retrieve_universe_menu,
+                message=message,
+                state=state,
+                settings=settings,
+                flow=flow,
+            )
+
         case MenuStep.SEASON:
+            selection = selected_universe_year(data)
+            if selection is None:
+                await handle_stale_selection(message=message, state=state)
+                return
+            universe, year = selection
             await show_or_stale(
                 show_menu=_show_retrieve_year_menu,
                 message=message,
                 state=state,
-                settings=settings,
-                services=services,
-                flow=flow,
-            )
-
-        case MenuStep.UNIVERSE:
-            year = selected_year(data)
-            if year is None:
-                await handle_stale_selection(message=message, state=state)
-                return
-            await show_or_stale(
-                show_menu=_show_retrieve_season_menu,
-                message=message,
-                state=state,
+                universe=universe,
                 year=year,
-                services=services,
                 settings=settings,
                 flow=flow,
             )
 
         case MenuStep.SUB_SEASON:
-            selection = selected_year_season(data)
+            selection = selected_universe_year(data)
             if selection is None:
                 await handle_stale_selection(message=message, state=state)
                 return
-            year, season = selection
+            universe, year = selection
             await show_or_stale(
-                show_menu=_show_retrieve_universe_menu,
+                show_menu=_show_retrieve_season_menu,
                 message=message,
                 state=state,
+                universe=universe,
                 year=year,
-                season=season,
-                services=services,
                 settings=settings,
                 flow=flow,
             )
 
         case MenuStep.SCOPE:
-            selection = selected_year_season_universe(data)
+            selection = selected_universe_year_season(data)
             if selection is None:
                 await handle_stale_selection(message=message, state=state)
                 return
-            year, season, universe = selection
-            clip_group = ClipGroup(year=year, season=season, universe=universe)
+            universe, year, season = selection
+            clip_group = ClipGroup(universe=universe, year=year, season=season)
 
             sub_groups = await _retrieve_sub_groups(
                 services=services,
@@ -291,12 +284,11 @@ async def _on_retrieve_back(
 
             if available_sub_seasons(sub_groups) == [SubSeason.NONE]:
                 await show_or_stale(
-                    show_menu=_show_retrieve_universe_menu,
+                    show_menu=_show_retrieve_season_menu,
                     message=message,
                     state=state,
+                    universe=universe,
                     year=year,
-                    season=season,
-                    services=services,
                     settings=settings,
                     flow=flow,
                 )
@@ -309,8 +301,8 @@ async def _on_retrieve_back(
                 clip_group=clip_group,
                 services=services,
                 settings=settings,
-                sub_groups=sub_groups,
                 flow=flow,
+                sub_groups=sub_groups,
             )
 
 
@@ -325,48 +317,50 @@ async def _on_retrieve_select(
     flow: FlowMenuDefinition,
 ) -> None:
     data = await state.get_data()
+    groups = data.get('groups')
+    if not isinstance(groups, list):
+        await handle_stale_selection(message=message, state=state)
+        return
 
     match callback_data.step:
+        case MenuStep.UNIVERSE:
+            universe = parse_universe(callback_data.value)
+            if universe is None:
+                await handle_stale_selection(message=message, state=state)
+                return
+            await show_or_stale(
+                show_menu=_show_retrieve_year_menu,
+                message=message,
+                state=state,
+                universe=universe,
+                settings=settings,
+                flow=flow,
+            )
+
         case MenuStep.YEAR:
+            universe = selected_universe(data)
             year = parse_year(callback_data.value)
-            if year is None:
+            if universe is None or year is None:
                 await handle_stale_selection(message=message, state=state)
                 return
             await show_or_stale(
                 show_menu=_show_retrieve_season_menu,
                 message=message,
                 state=state,
+                universe=universe,
                 year=year,
-                services=services,
                 settings=settings,
                 flow=flow,
             )
 
         case MenuStep.SEASON:
-            year = selected_year(data)
+            selection = selected_universe_year(data)
             season = parse_season(callback_data.value)
-            if year is None or season is None:
+            if selection is None or season is None:
                 await handle_stale_selection(message=message, state=state)
                 return
-            await show_or_stale(
-                show_menu=_show_retrieve_universe_menu,
-                message=message,
-                state=state,
-                year=year,
-                season=season,
-                services=services,
-                settings=settings,
-                flow=flow,
-            )
-
-        case MenuStep.UNIVERSE:
-            selection = selected_year_season(data)
-            universe = parse_universe(callback_data.value)
-            if selection is None or universe is None:
-                await handle_stale_selection(message=message, state=state)
-                return
-            year, season = selection
-            clip_group = ClipGroup(year=year, season=season, universe=universe)
+            universe, year = selection
+            clip_group = ClipGroup(universe=universe, year=year, season=season)
             await show_or_stale(
                 show_menu=_show_retrieve_sub_season_menu,
                 message=message,
@@ -378,13 +372,13 @@ async def _on_retrieve_select(
             )
 
         case MenuStep.SUB_SEASON:
-            selection = selected_year_season_universe(data)
+            selection = selected_universe_year_season(data)
             sub_season = parse_sub_season(callback_data.value)
             if selection is None or not isinstance(sub_season, SubSeason):
                 await handle_stale_selection(message=message, state=state)
                 return
-            year, season, universe = selection
-            clip_group = ClipGroup(year=year, season=season, universe=universe)
+            universe, year, season = selection
+            clip_group = ClipGroup(universe=universe, year=year, season=season)
             await show_or_stale(
                 show_menu=_show_retrieve_scope_menu,
                 message=message,
@@ -397,12 +391,12 @@ async def _on_retrieve_select(
             )
 
         case MenuStep.SCOPE:
-            selection = selected_year_season_universe_sub_season(data)
+            selection = selected_universe_year_season_sub_season(data)
             if selection is None:
                 await handle_stale_selection(message=message, state=state)
                 return
-            year, season, universe, sub_season = selection
-            clip_group = ClipGroup(year=year, season=season, universe=universe)
+            universe, year, season, sub_season = selection
+            clip_group = ClipGroup(universe=universe, year=year, season=season)
 
             sub_groups = await _retrieve_sub_groups(
                 services=services,
@@ -420,9 +414,9 @@ async def _on_retrieve_select(
             if callback_data.value == ALL_SCOPES_CALLBACK_VALUE:
                 selected_labels = flow_selection_labels(
                     flow,
+                    universe=universe,
                     year=year,
                     season=season,
-                    universe=universe,
                     sub_season=sub_season,
                     scope='All',
                 )
@@ -434,9 +428,9 @@ async def _on_retrieve_select(
                 scopes = [scope]
                 selected_labels = flow_selection_labels(
                     flow,
+                    universe=universe,
                     year=year,
                     season=season,
-                    universe=universe,
                     sub_season=sub_season,
                     scope=scope,
                 )
@@ -466,20 +460,19 @@ async def _show_retrieve_year_menu(
     *,
     message: Message,
     state: FSMContext,
+    universe: Universe,
     settings: Settings,
     flow: FlowMenuDefinition = _GET_FLOW,
-    services: Services | None = None,
-    groups: list[ClipGroup] | None = None,
+    year: int | None = None,
 ) -> bool:
-    if groups is None:
-        if services is None:
-            return False
-        groups = await services.clip_store.list_groups()
-
-    available_years = available_group_years(groups)
-    if not available_years:
+    data = await state.get_data()
+    groups = data.get('groups')
+    if not isinstance(groups, list):
         return False
-    year_universe = year_option_universe(current_year=date.today().year, min_year=settings.min_clip_year)
+    available_years = available_group_years(groups, universe=universe)
+    if year is not None and year not in available_years:
+        return False
+    year_options = year_option_universe(current_year=date.today().year, min_year=settings.min_clip_year)
 
     await show_fixed_option_menu(
         flow=flow,
@@ -488,7 +481,8 @@ async def _show_retrieve_year_menu(
         message_width=settings.message_width,
         step=MenuStep.YEAR,
         prompt='Select year:',
-        option_universe=list(reversed(year_universe)),
+        universe=universe,
+        option_universe=list(reversed(year_options)),
         available_options=available_years,
         option_value=str,
         option_text=str,
@@ -500,13 +494,16 @@ async def _show_retrieve_season_menu(
     *,
     message: Message,
     state: FSMContext,
+    universe: Universe,
     year: int,
-    services: Services,
     settings: Settings,
     flow: FlowMenuDefinition = _GET_FLOW,
 ) -> bool:
-    groups = await services.clip_store.list_groups()
-    available_seasons = available_group_seasons(groups, year=year)
+    data = await state.get_data()
+    groups = data.get('groups')
+    if not isinstance(groups, list):
+        return False
+    available_seasons = available_group_seasons(groups, universe=universe, year=year)
     allowed_seasons = store_allowed_seasons(year=year, today=date.today())
     available_seasons = [season for season in available_seasons if season in allowed_seasons]
     if not available_seasons:
@@ -519,6 +516,7 @@ async def _show_retrieve_season_menu(
         message_width=settings.message_width,
         step=MenuStep.SEASON,
         prompt='Select season:',
+        universe=universe,
         year=year,
         option_universe=list(Season),
         available_options=available_seasons,
@@ -532,17 +530,14 @@ async def _show_retrieve_universe_menu(
     *,
     message: Message,
     state: FSMContext,
-    year: int,
-    season: Season,
-    services: Services,
     settings: Settings,
     flow: FlowMenuDefinition = _GET_FLOW,
 ) -> bool:
-    groups = await services.clip_store.list_groups()
-    available_universes = available_group_universes(groups, year=year, season=season)
-    if not available_universes:
+    data = await state.get_data()
+    groups = data.get('groups')
+    if not isinstance(groups, list):
         return False
-
+    available_universes = {group.universe for group in groups}
     await show_fixed_option_menu(
         flow=flow,
         message=message,
@@ -550,10 +545,8 @@ async def _show_retrieve_universe_menu(
         message_width=settings.message_width,
         step=MenuStep.UNIVERSE,
         prompt='Select universe:',
-        year=year,
-        season=season,
         option_universe=tuple(Universe),
-        available_options=available_universes,
+        available_options=[universe for universe in Universe if universe in available_universes],
         option_value=lambda universe: universe.value,
         option_text=lambda universe: universe.value.title(),
     )
@@ -597,9 +590,9 @@ async def _show_retrieve_sub_season_menu(
         message_width=settings.message_width,
         step=MenuStep.SUB_SEASON,
         prompt='Select sub-season:',
+        universe=clip_group.universe,
         year=clip_group.year,
         season=clip_group.season,
-        universe=clip_group.universe,
         option_universe=tuple(SubSeason),
         available_options=sub_seasons,
         option_value=encode_sub_season,
@@ -640,9 +633,9 @@ async def _show_retrieve_scope_menu(
         message_width=settings.message_width,
         step=MenuStep.SCOPE,
         prompt='Select scope:',
+        universe=clip_group.universe,
         year=clip_group.year,
         season=clip_group.season,
-        universe=clip_group.universe,
         sub_season=sub_season,
         option_universe=(ALL_SCOPES_CALLBACK_VALUE, *Scope),
         available_options=available_scope_options,

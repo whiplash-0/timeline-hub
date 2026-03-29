@@ -29,25 +29,25 @@ class MenuAction(StrEnum):
 
 
 class MenuStep(StrEnum):
+    UNIVERSE = auto()
     YEAR = auto()
     SEASON = auto()
-    UNIVERSE = auto()
     SUB_SEASON = auto()
     SCOPE = auto()
 
 
 class RetrieveClipFlow(StatesGroup):
+    universe = State()
     year = State()
     season = State()
-    universe = State()
     sub_season = State()
     scope = State()
 
 
 class StoreClipFlow(StatesGroup):
+    universe = State()
     year = State()
     season = State()
-    universe = State()
     sub_season = State()
     scope = State()
 
@@ -58,16 +58,16 @@ class ReconcileClipFlow(StatesGroup):
 
 
 RETRIEVE_STATE_BY_STEP = {
+    MenuStep.UNIVERSE: RetrieveClipFlow.universe,
     MenuStep.YEAR: RetrieveClipFlow.year,
     MenuStep.SEASON: RetrieveClipFlow.season,
-    MenuStep.UNIVERSE: RetrieveClipFlow.universe,
     MenuStep.SUB_SEASON: RetrieveClipFlow.sub_season,
     MenuStep.SCOPE: RetrieveClipFlow.scope,
 }
 STORE_STATE_BY_STEP = {
+    MenuStep.UNIVERSE: StoreClipFlow.universe,
     MenuStep.YEAR: StoreClipFlow.year,
     MenuStep.SEASON: StoreClipFlow.season,
-    MenuStep.UNIVERSE: StoreClipFlow.universe,
     MenuStep.SUB_SEASON: StoreClipFlow.sub_season,
     MenuStep.SCOPE: StoreClipFlow.scope,
 }
@@ -135,20 +135,20 @@ def width_reserved_text(*, text: str, message_width: int) -> dict[str, Any]:
 
 def selection_labels(
     *,
+    universe: Universe | object = UNSET,
     year: int | object = UNSET,
     season: Season | object = UNSET,
-    universe: Universe | object = UNSET,
     sub_season: SubSeason | object = UNSET,
     scope: Scope | str | object = UNSET,
 ) -> list[str]:
     labels: list[str] = []
 
+    if universe is not UNSET:
+        labels.append(format_selection_value(universe))
     if year is not UNSET:
         labels.append(format_selection_value(year))
     if season is not UNSET:
         labels.append(format_selection_value(season))
-    if universe is not UNSET:
-        labels.append(format_selection_value(universe))
     if sub_season is not UNSET and sub_season is not SubSeason.NONE:
         labels.append(format_selection_value(sub_season))
     if scope is not UNSET:
@@ -408,11 +408,14 @@ async def set_flow_context(
     mode: str,
     menu_message_id: int,
     fsm_state: State,
+    universe: Universe | object = UNSET,
     year: int | object = UNSET,
     season: Season | object = UNSET,
-    universe: Universe | object = UNSET,
     sub_season: SubSeason | object = UNSET,
 ) -> None:
+    existing_data = await state.get_data()
+    groups = existing_data.get('groups')
+
     await state.clear()
     await state.set_state(fsm_state)
 
@@ -420,12 +423,14 @@ async def set_flow_context(
         'mode': mode,
         'menu_message_id': menu_message_id,
     }
+    if isinstance(groups, list):
+        data['groups'] = groups
+    if universe is not UNSET:
+        data['universe'] = universe
     if year is not UNSET:
         data['year'] = year
     if season is not UNSET:
         data['season'] = season
-    if universe is not UNSET:
-        data['universe'] = universe
     if sub_season is not UNSET:
         data['sub_season'] = sub_season
 

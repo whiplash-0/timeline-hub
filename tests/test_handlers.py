@@ -391,12 +391,12 @@ def test_handlers_package_router_imports_cleanly() -> None:
 
 def test_selection_labels_omits_none_sub_season_from_visible_path() -> None:
     assert selection_labels(
+        universe=Universe.WEST,
         year=2026,
         season=Season.S1,
-        universe=Universe.WEST,
         sub_season=SubSeason.NONE,
         scope=Scope.COLLECTION,
-    ) == ['2026', '1', 'West', 'Collection']
+    ) == ['West', '2026', '1', 'Collection']
 
 
 @pytest.mark.parametrize(
@@ -437,8 +437,8 @@ def test_reconcile_summary_omits_zero_value_lines(
 @pytest.mark.parametrize(
     ('text', 'expected'),
     [
-        ('242W', ClipGroup(year=2024, season=Season.S2, universe=Universe.WEST)),
-        ('215E', ClipGroup(year=2021, season=Season.S5, universe=Universe.EAST)),
+        ('W242', ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2)),
+        ('e215', ClipGroup(universe=Universe.EAST, year=2021, season=Season.S5)),
     ],
 )
 def test_parse_route_text_accepts_case_insensitive_universe(
@@ -486,8 +486,15 @@ async def test_on_retrieve_entry_edits_to_no_clips_stored_when_empty() -> None:
     )
 
     callback.answer.assert_awaited_once()
-    message.edit_text.assert_awaited_once_with('No clips stored', reply_markup=None)
-    assert state.current_state is None
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _selected_kwargs('Get', prompt='Select universe:', message_width=settings.message_width),
+    )
+    reply_markup = message.edit_text.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], [DUMMY_BUTTON_TEXT], ['Back']]
+    services.clip_store.list_groups.assert_awaited_once()
+    assert state.current_state == RetrieveClipFlow.universe.state
     assert state.clear_count == 1
 
 
@@ -1285,7 +1292,7 @@ async def test_route_action_stores_clips_in_caption_route_order_across_message_g
         _fake_message(
             chat_id=77,
             message_id=1,
-            caption='251w',
+            caption='w251',
             video=_fake_video(file_id='f1', file_name='one.mp4'),
             media_group_id='g1',
         ),
@@ -1342,9 +1349,9 @@ async def test_route_action_stores_clips_in_caption_route_order_across_message_g
     stored_clips = clip_store.store.await_args.args[0]
     assert [clip.filename for clip in stored_clips] == ['one.mp4', 'two.mp4', 'three.mp4']
     assert clip_store.store.await_args.kwargs['clip_group'] == ClipGroup(
+        universe=Universe.WEST,
         year=2025,
         season=Season.S1,
-        universe=Universe.WEST,
     )
     assert clip_store.store.await_args.kwargs['clip_sub_group'] == ClipSubGroup(
         sub_season=SubSeason.NONE,
@@ -1352,11 +1359,11 @@ async def test_route_action_stores_clips_in_caption_route_order_across_message_g
     )
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _route_selected_kwargs(('2025', '1', 'West', 'Source')),
+        _route_selected_kwargs(('West', '2025', '1', 'Source')),
     )
     message.answer.assert_awaited_once_with(**Text('Stored: ', Bold('3')).as_kwargs())
     clip_store.compact.assert_awaited_once_with(
-        clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
         clip_sub_group=ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
         batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
     )
@@ -1374,7 +1381,7 @@ async def test_route_action_splits_store_calls_when_caption_route_overrides() ->
         _fake_message(
             chat_id=77,
             message_id=1,
-            caption='251w',
+            caption='w251',
             video=_fake_video(file_id='f1', file_name='one.mp4'),
             media_group_id='g1',
         ),
@@ -1387,7 +1394,7 @@ async def test_route_action_splits_store_calls_when_caption_route_overrides() ->
         _fake_message(
             chat_id=77,
             message_id=3,
-            caption='242E',
+            caption='E242',
             video=_fake_video(file_id='f3', file_name='three.mp4'),
             media_group_id='g1',
         ),
@@ -1435,14 +1442,14 @@ async def test_route_action_splits_store_calls_when_caption_route_overrides() ->
     assert [clip.filename for clip in first_batch] == ['one.mp4', 'two.mp4']
     assert [clip.filename for clip in second_batch] == ['three.mp4', 'four.mp4']
     assert clip_store.store.await_args_list[0].kwargs['clip_group'] == ClipGroup(
+        universe=Universe.WEST,
         year=2025,
         season=Season.S1,
-        universe=Universe.WEST,
     )
     assert clip_store.store.await_args_list[1].kwargs['clip_group'] == ClipGroup(
+        universe=Universe.EAST,
         year=2024,
         season=Season.S2,
-        universe=Universe.EAST,
     )
     assert all(
         call.kwargs['clip_sub_group'] == ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE)
@@ -1451,8 +1458,8 @@ async def test_route_action_splits_store_calls_when_caption_route_overrides() ->
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
         _route_selected_kwargs(
-            ('2025', '1', 'West', 'Source'),
-            ('2024', '2', 'East', 'Source'),
+            ('West', '2025', '1', 'Source'),
+            ('East', '2024', '2', 'Source'),
         ),
     )
     message.answer.assert_awaited_once_with(
@@ -1466,12 +1473,12 @@ async def test_route_action_splits_store_calls_when_caption_route_overrides() ->
     )
     assert clip_store.compact.await_args_list == [
         call(
-            clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+            clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             clip_sub_group=ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
             batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
         ),
         call(
-            clip_group=ClipGroup(year=2024, season=Season.S2, universe=Universe.EAST),
+            clip_group=ClipGroup(universe=Universe.EAST, year=2024, season=Season.S2),
             clip_sub_group=ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.SOURCE),
             batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
         ),
@@ -1550,7 +1557,7 @@ async def test_route_action_ignores_standalone_text_for_routing_context() -> Non
     callback = _fake_callback(message)
     state = _FakeState()
     buffer = ChatMessageBuffer()
-    buffer.append(_fake_message(chat_id=77, message_id=1, text='251w'), chat_id=77)
+    buffer.append(_fake_message(chat_id=77, message_id=1, text='w251'), chat_id=77)
     buffer.append(
         _fake_message(chat_id=77, message_id=2, video=_fake_video(file_id='f1', file_name='one.mp4')),
         chat_id=77,
@@ -1559,7 +1566,7 @@ async def test_route_action_ignores_standalone_text_for_routing_context() -> Non
         _fake_message(
             chat_id=77,
             message_id=3,
-            text='242e',
+            text='e242',
             media_group_id='g1',
         ),
         chat_id=77,
@@ -1594,7 +1601,7 @@ async def test_route_action_fails_before_execution_when_later_video_caption_is_i
         _fake_message(
             chat_id=77,
             message_id=1,
-            caption='251w',
+            caption='w251',
             video=_fake_video(file_id='f1', file_name='one.mp4'),
         ),
         chat_id=77,
@@ -1658,7 +1665,7 @@ async def test_route_action_rejects_future_year_before_execution(monkeypatch: py
         _fake_message(
             chat_id=77,
             message_id=1,
-            caption='271w',
+            caption='w271',
             video=_fake_video(file_id='f1', file_name='one.mp4'),
         ),
         chat_id=77,
@@ -1695,7 +1702,7 @@ async def test_route_action_rejects_year_below_min_clip_year_before_execution() 
         _fake_message(
             chat_id=77,
             message_id=1,
-            caption='211w',
+            caption='w211',
             video=_fake_video(file_id='f1', file_name='one.mp4'),
         ),
         chat_id=77,
@@ -1741,7 +1748,7 @@ async def test_route_action_rejects_season_not_allowed_for_current_year_before_e
         _fake_message(
             chat_id=77,
             message_id=1,
-            caption='264w',
+            caption='w264',
             video=_fake_video(file_id='f1', file_name='one.mp4'),
         ),
         chat_id=77,
@@ -1783,12 +1790,12 @@ async def test_store_entry_places_newest_year_in_top_right_slot() -> None:
     message.edit_text.assert_awaited_once()
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _selected_kwargs('Store', prompt='Select year:', message_width=settings.message_width),
+        _selected_kwargs('Store', prompt='Select universe:', message_width=settings.message_width),
     )
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     _assert_no_dummy_buttons(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['2023', '2026'], ['2022', '2024', '2025'], ['Back']]
+    assert _keyboard_rows(reply_markup) == [['West'], ['East'], ['Back']]
     services.clip_store.list_groups.assert_not_awaited()
     services.clip_store.list_sub_groups.assert_not_awaited()
     assert state.data['buffer_version'] == 0
@@ -1824,7 +1831,7 @@ async def test_reconcile_entry_derives_group_and_opens_sub_season_menu() -> None
         chat_id=1,
     )
     clip_store = SimpleNamespace(
-        derive_group=AsyncMock(return_value=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST))
+        derive_group=AsyncMock(return_value=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1))
     )
     services = _services(clip_store=clip_store, buffer=buffer)
     settings = _settings()
@@ -1841,11 +1848,11 @@ async def test_reconcile_entry_derives_group_and_opens_sub_season_menu() -> None
 
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _selected_kwargs('Reconcile', '2025', '1', 'West', prompt='Select sub-season:', message_width=35),
+        _selected_kwargs('Reconcile', 'West', '2025', '1', prompt='Select sub-season:', message_width=35),
     )
     clip_store.derive_group.assert_awaited_once_with([['one.mp4'], ['two.mp4', 'three.mp4']])
     assert state.current_state == ReconcileClipFlow.sub_season.state
-    assert state.data['clip_group'] == ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST)
+    assert state.data['clip_group'] == ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
     assert state.data['filename_batches'] == [['one.mp4'], ['two.mp4', 'three.mp4']]
     assert state.data['buffer_version'] == pre_flush_buffer_version
     assert [message.message_id for message in services.chat_message_buffer.peek(1)] == [1, 2, 3]
@@ -1857,7 +1864,7 @@ async def test_reconcile_entry_prefers_current_buffered_clips_over_stored_reconc
     callback = _fake_callback(message)
     state = _FakeState()
     await state.update_data(
-        clip_group=ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
         filename_batches=[['old-one.mp4']],
         buffer_version=0,
     )
@@ -1886,7 +1893,7 @@ async def test_reconcile_entry_prefers_current_buffered_clips_over_stored_reconc
         chat_id=77,
     )
     clip_store = SimpleNamespace(
-        derive_group=AsyncMock(return_value=ClipGroup(year=2025, season=Season.S2, universe=Universe.EAST))
+        derive_group=AsyncMock(return_value=ClipGroup(universe=Universe.EAST, year=2025, season=Season.S2))
     )
     services = _services(clip_store=clip_store, buffer=buffer)
 
@@ -1902,9 +1909,9 @@ async def test_reconcile_entry_prefers_current_buffered_clips_over_stored_reconc
     clip_store.derive_group.assert_awaited_once_with([['new-one.mp4'], ['new-two.mp4', 'new-three.mp4']])
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _selected_kwargs('Reconcile', '2025', '2', 'East', prompt='Select sub-season:', message_width=35),
+        _selected_kwargs('Reconcile', 'East', '2025', '2', prompt='Select sub-season:', message_width=35),
     )
-    assert state.data['clip_group'] == ClipGroup(year=2025, season=Season.S2, universe=Universe.EAST)
+    assert state.data['clip_group'] == ClipGroup(universe=Universe.EAST, year=2025, season=Season.S2)
     assert state.data['filename_batches'] == [['new-one.mp4'], ['new-two.mp4', 'new-three.mp4']]
     assert [message.message_id for message in services.chat_message_buffer.peek(77)] == [1, 2, 3]
 
@@ -1915,7 +1922,7 @@ async def test_reconcile_entry_reuses_stored_state_when_current_buffer_has_no_fi
     callback = _fake_callback(message)
     state = _FakeState()
     await state.update_data(
-        clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
         filename_batches=[['one.mp4'], ['two.mp4', 'three.mp4']],
         buffer_version=0,
     )
@@ -1937,7 +1944,7 @@ async def test_reconcile_entry_reuses_stored_state_when_current_buffer_has_no_fi
     clip_store.derive_group.assert_not_awaited()
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _selected_kwargs('Reconcile', '2025', '1', 'West', prompt='Select sub-season:', message_width=35),
+        _selected_kwargs('Reconcile', 'West', '2025', '1', prompt='Select sub-season:', message_width=35),
     )
     assert state.data['filename_batches'] == [['one.mp4'], ['two.mp4', 'three.mp4']]
 
@@ -1974,7 +1981,7 @@ async def test_reconcile_entry_ignores_non_video_buffered_messages() -> None:
         chat_id=77,
     )
     clip_store = SimpleNamespace(
-        derive_group=AsyncMock(return_value=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST))
+        derive_group=AsyncMock(return_value=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1))
     )
     services = _services(clip_store=clip_store, buffer=buffer)
 
@@ -2003,7 +2010,7 @@ async def test_reconcile_sub_season_selection_becomes_stale_when_buffer_changes_
         chat_id=77,
     )
     clip_store = SimpleNamespace(
-        derive_group=AsyncMock(return_value=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST))
+        derive_group=AsyncMock(return_value=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1))
     )
     services = _services(clip_store=clip_store, buffer=buffer)
 
@@ -2045,7 +2052,7 @@ async def test_reconcile_back_from_scope_returns_to_sub_season_menu() -> None:
         mode=FLOW_RECONCILE,
         menu_message_id=32,
         sub_season=SubSeason.NONE,
-        clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
         filename_batches=[['one.mp4'], ['two.mp4', 'three.mp4']],
         buffer_version=0,
     )
@@ -2062,7 +2069,7 @@ async def test_reconcile_back_from_scope_returns_to_sub_season_menu() -> None:
 
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _selected_kwargs('Reconcile', '2025', '1', 'West', prompt='Select sub-season:', message_width=35),
+        _selected_kwargs('Reconcile', 'West', '2025', '1', prompt='Select sub-season:', message_width=35),
     )
     assert state.current_state == ReconcileClipFlow.sub_season.state
 
@@ -2076,7 +2083,7 @@ async def test_reconcile_back_from_sub_season_returns_to_clip_action_menu() -> N
     await state.update_data(
         mode=FLOW_RECONCILE,
         menu_message_id=33,
-        clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
         filename_batches=[['one.mp4'], ['two.mp4', 'three.mp4']],
         buffer_version=0,
     )
@@ -2128,17 +2135,12 @@ async def test_retrieve_back_from_season_keeps_year_slots_and_top_right_priority
     callback = _fake_callback(message)
     state = _FakeState()
     await state.set_state(RetrieveClipFlow.season)
-    await state.update_data(mode='get', menu_message_id=11, year=2025)
-    services = _services(
-        clip_store=SimpleNamespace(
-            list_groups=AsyncMock(
-                return_value=[
-                    ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
-                    ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
-                ]
-            )
-        )
-    )
+    groups = [
+        ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+    ]
+    await state.update_data(mode='get', menu_message_id=11, universe=Universe.WEST, year=2025, groups=groups)
+    services = _services(clip_store=SimpleNamespace(list_groups=AsyncMock(return_value=groups)))
 
     await on_retrieve_menu(
         callback,
@@ -2152,7 +2154,7 @@ async def test_retrieve_back_from_season_keeps_year_slots_and_top_right_priority
     message.edit_text.assert_awaited_once()
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _selected_kwargs('Get', prompt='Select year:', message_width=35),
+        _selected_kwargs('Get', 'West', prompt='Select year:', message_width=35),
     )
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
@@ -2161,6 +2163,7 @@ async def test_retrieve_back_from_season_keeps_year_slots_and_top_right_priority
         [DUMMY_BUTTON_TEXT, '2024', '2025'],
         ['Back'],
     ]
+    services.clip_store.list_groups.assert_not_awaited()
     assert state.current_state == RetrieveClipFlow.year.state
 
 
@@ -2173,8 +2176,8 @@ async def test_on_retrieve_entry_opens_year_menu_with_get_selected() -> None:
         clip_store=SimpleNamespace(
             list_groups=AsyncMock(
                 return_value=[
-                    ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
-                    ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
+                    ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+                    ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
                 ]
             )
         )
@@ -2191,16 +2194,13 @@ async def test_on_retrieve_entry_opens_year_menu_with_get_selected() -> None:
     callback.answer.assert_awaited_once()
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _selected_kwargs('Get', prompt='Select year:', message_width=35),
+        _selected_kwargs('Get', prompt='Select universe:', message_width=35),
     )
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [
-        [DUMMY_BUTTON_TEXT, DUMMY_BUTTON_TEXT],
-        [DUMMY_BUTTON_TEXT, '2024', '2025'],
-        ['Back'],
-    ]
-    assert state.current_state == RetrieveClipFlow.year.state
+    assert _keyboard_rows(reply_markup) == [['West'], [DUMMY_BUTTON_TEXT], ['Back']]
+    services.clip_store.list_groups.assert_awaited_once()
+    assert state.current_state == RetrieveClipFlow.universe.state
 
 
 @pytest.mark.asyncio
@@ -2212,8 +2212,8 @@ async def test_on_retrieve_entry_opens_year_menu_with_pull_selected() -> None:
         clip_store=SimpleNamespace(
             list_groups=AsyncMock(
                 return_value=[
-                    ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
-                    ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
+                    ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+                    ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
                 ]
             )
         )
@@ -2229,9 +2229,53 @@ async def test_on_retrieve_entry_opens_year_menu_with_pull_selected() -> None:
 
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _selected_kwargs('Pull', prompt='Select year:', message_width=35),
+        _selected_kwargs('Pull', prompt='Select universe:', message_width=35),
     )
+    reply_markup = message.edit_text.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [['West'], [DUMMY_BUTTON_TEXT], ['Back']]
+    services.clip_store.list_groups.assert_awaited_once()
+    assert state.current_state == RetrieveClipFlow.universe.state
+
+
+@pytest.mark.asyncio
+async def test_retrieve_universe_selection_keeps_cached_groups_and_opens_year_menu() -> None:
+    message = _fake_message(text='Select universe:', message_id=113)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    groups = [
+        ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+    ]
+    await state.set_state(RetrieveClipFlow.universe)
+    await state.update_data(
+        mode='get',
+        menu_message_id=113,
+        groups=groups,
+    )
+
+    await on_retrieve_menu(
+        callback,
+        RetrieveCallbackData(action=MenuAction.SELECT, step=MenuStep.UNIVERSE, value=Universe.WEST.value),
+        AsyncMock(),
+        _services(clip_store=SimpleNamespace()),
+        _settings(),
+        state,
+    )
+
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        _selected_kwargs('Get', 'West', prompt='Select year:', message_width=35),
+    )
+    reply_markup = message.edit_text.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [
+        [DUMMY_BUTTON_TEXT, DUMMY_BUTTON_TEXT],
+        [DUMMY_BUTTON_TEXT, '2024', '2025'],
+        ['Back'],
+    ]
     assert state.current_state == RetrieveClipFlow.year.state
+    assert state.data['groups'] == groups
 
 
 @pytest.mark.asyncio
@@ -2293,10 +2337,11 @@ async def test_store_season_menu_limits_current_year_and_uses_padding_line(monke
         message=message,
         state=state,
         settings=settings,
+        universe=Universe.WEST,
         year=2026,
     )
 
-    expected = _selected_kwargs('Store', '2026', prompt='Select season:', message_width=21)
+    expected = _selected_kwargs('Store', 'West', '2026', prompt='Select season:', message_width=21)
     _assert_format_kwargs(message.edit_text.await_args.kwargs, expected)
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
@@ -2313,11 +2358,9 @@ async def test_store_universe_menu_uses_fixed_west_east_layout() -> None:
         message=message,
         state=state,
         settings=settings,
-        year=2024,
-        season=Season.S3,
     )
 
-    expected = _selected_kwargs('Store', '2024', '3', prompt='Select universe:', message_width=18)
+    expected = _selected_kwargs('Store', prompt='Select universe:', message_width=18)
     _assert_format_kwargs(message.edit_text.await_args.kwargs, expected)
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
@@ -2334,7 +2377,7 @@ async def test_store_sub_season_menu_uses_fixed_snake_layout() -> None:
         message=message,
         state=state,
         settings=_settings(),
-        clip_group=ClipGroup(year=2024, season=Season.S2, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S2),
     )
 
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
@@ -2352,7 +2395,7 @@ async def test_retrieve_scope_menu_uses_fixed_scope_grid_with_dummy_slots() -> N
     await _show_retrieve_scope_menu(
         message=message,
         state=state,
-        clip_group=ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
         sub_season=SubSeason.NONE,
         services=services,
         settings=_settings(),
@@ -2371,7 +2414,7 @@ async def test_retrieve_scope_menu_uses_fixed_scope_grid_with_dummy_slots() -> N
     await _show_retrieve_scope_menu(
         message=message_single,
         state=state_single,
-        clip_group=ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
         sub_season=SubSeason.NONE,
         services=services,
         settings=_settings(),
@@ -2398,6 +2441,7 @@ async def test_pull_scope_all_with_one_scope_sends_single_scope_normally() -> No
     await state.update_data(
         mode=FLOW_PULL,
         menu_message_id=741,
+        groups=[ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)],
         year=2024,
         season=Season.S1,
         universe=Universe.WEST,
@@ -2422,11 +2466,11 @@ async def test_pull_scope_all_with_one_scope_sends_single_scope_normally() -> No
     callback.answer.assert_awaited_once()
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _selected_kwargs('Pull', '2024', '1', 'West', 'All'),
+        _selected_kwargs('Pull', 'West', '2024', '1', 'All'),
     )
     assert clip_store.calls == [
         (
-            ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
+            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
             None,
         )
@@ -2447,6 +2491,7 @@ async def test_get_scope_all_normalizes_before_sending(monkeypatch: pytest.Monke
     await state.update_data(
         mode='get',
         menu_message_id=742,
+        groups=[ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)],
         year=2024,
         season=Season.S1,
         universe=Universe.WEST,
@@ -2477,7 +2522,7 @@ async def test_get_scope_all_normalizes_before_sending(monkeypatch: pytest.Monke
 
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _selected_kwargs('Get', '2024', '1', 'West', 'All'),
+        _selected_kwargs('Get', 'West', '2024', '1', 'All'),
     )
     assert bot.send_video.await_args.kwargs['video'].filename == 'one.mp4'
     assert bot.send_video.await_args.kwargs['video'].data == b'normalized:one'
@@ -2494,7 +2539,7 @@ async def test_retrieve_sub_season_menu_skips_only_when_none_is_only_option() ->
     await _show_retrieve_sub_season_menu(
         message=message_none_only,
         state=state_none_only,
-        clip_group=ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
         services=services,
         settings=_settings(),
         sub_groups=[ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)],
@@ -2514,7 +2559,7 @@ async def test_retrieve_sub_season_menu_skips_only_when_none_is_only_option() ->
     await _show_retrieve_sub_season_menu(
         message=message_with_extra,
         state=state_with_extra,
-        clip_group=ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
         services=services,
         settings=_settings(),
         sub_groups=[
@@ -2542,11 +2587,11 @@ async def test_store_scope_menu_uses_fixed_scope_grid_with_dummy_all_slot() -> N
         message=message,
         state=state,
         settings=_settings(),
-        clip_group=ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
         sub_season=SubSeason.NONE,
     )
 
-    expected = _selected_kwargs('Store', '2024', '1', 'West', prompt='Select scope:', message_width=35)
+    expected = _selected_kwargs('Store', 'West', '2024', '1', prompt='Select scope:', message_width=35)
     _assert_format_kwargs(message.edit_text.await_args.kwargs, expected)
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
@@ -2558,32 +2603,27 @@ async def test_retrieve_season_menu_uses_store_slot_universe_with_dummy_substitu
     message = _fake_message(message_id=78)
     state = _FakeState()
     settings = _settings(message_width=21)
-    services = _services(
-        clip_store=SimpleNamespace(
-            list_groups=AsyncMock(
-                return_value=[
-                    ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
-                    ClipGroup(year=2024, season=Season.S3, universe=Universe.EAST),
-                ]
-            )
-        )
-    )
+    groups = [
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipGroup(universe=Universe.EAST, year=2024, season=Season.S3),
+    ]
+    await state.update_data(groups=groups)
 
     await _show_retrieve_season_menu(
         message=message,
         state=state,
+        universe=Universe.WEST,
         year=2024,
-        services=services,
         settings=settings,
     )
 
-    expected = _selected_kwargs('Get', '2024', prompt='Select season:', message_width=21)
+    expected = _selected_kwargs('Get', 'West', '2024', prompt='Select season:', message_width=21)
     _assert_format_kwargs(message.edit_text.await_args.kwargs, expected)
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [
         [DUMMY_BUTTON_TEXT, '1'],
-        [DUMMY_BUTTON_TEXT, '3', DUMMY_BUTTON_TEXT],
+        [DUMMY_BUTTON_TEXT, DUMMY_BUTTON_TEXT, DUMMY_BUTTON_TEXT],
         ['Back'],
     ]
 
@@ -2602,25 +2642,20 @@ async def test_retrieve_season_menu_limits_current_year_to_store_boundary_and_us
     message = _fake_message(message_id=80)
     state = _FakeState()
     settings = _settings(message_width=21)
-    services = _services(
-        clip_store=SimpleNamespace(
-            list_groups=AsyncMock(
-                return_value=[
-                    ClipGroup(year=2026, season=Season.S1, universe=Universe.WEST),
-                ]
-            )
-        )
-    )
+    groups = [
+        ClipGroup(universe=Universe.WEST, year=2026, season=Season.S1),
+    ]
+    await state.update_data(groups=groups)
 
     await _show_retrieve_season_menu(
         message=message,
         state=state,
+        universe=Universe.WEST,
         year=2026,
-        services=services,
         settings=settings,
     )
 
-    expected = _selected_kwargs('Get', '2026', prompt='Select season:', message_width=21)
+    expected = _selected_kwargs('Get', 'West', '2026', prompt='Select season:', message_width=21)
     _assert_format_kwargs(message.edit_text.await_args.kwargs, expected)
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
@@ -2636,26 +2671,18 @@ async def test_retrieve_universe_menu_uses_store_slot_universe_with_dummy_substi
     message = _fake_message(message_id=79)
     state = _FakeState()
     settings = _settings(message_width=18)
-    services = _services(
-        clip_store=SimpleNamespace(
-            list_groups=AsyncMock(
-                return_value=[
-                    ClipGroup(year=2024, season=Season.S3, universe=Universe.WEST),
-                ]
-            )
-        )
-    )
+    groups = [
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S3),
+    ]
+    await state.update_data(groups=groups)
 
     await _show_retrieve_universe_menu(
         message=message,
         state=state,
-        year=2024,
-        season=Season.S3,
-        services=services,
         settings=settings,
     )
 
-    expected = _selected_kwargs('Get', '2024', '3', prompt='Select universe:', message_width=18)
+    expected = _selected_kwargs('Get', prompt='Select universe:', message_width=18)
     _assert_format_kwargs(message.edit_text.await_args.kwargs, expected)
     reply_markup = message.edit_text.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
@@ -2723,14 +2750,14 @@ async def test_store_scope_selection_aggregates_results_and_sends_exact_summary(
         state,
     )
 
-    expected_selected = _selected_kwargs('Store', '2025', '1', 'West', 'Collection')
+    expected_selected = _selected_kwargs('Store', 'West', '2025', '1', 'Collection')
     _assert_format_kwargs(message.edit_text.await_args.kwargs, expected_selected)
     assert clip_store.store.await_count == 2
     first_group = clip_store.store.await_args_list[0].args[0]
     second_group = clip_store.store.await_args_list[1].args[0]
     assert [clip.filename for clip in first_group] == ['one.mp4']
     assert [clip.filename for clip in second_group] == ['two.mp4', 'three.mp4']
-    expected_group = ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST)
+    expected_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
     expected_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
     assert clip_store.store.await_args_list[0].kwargs['clip_group'] == expected_group
     assert clip_store.store.await_args_list[0].kwargs['clip_sub_group'] == expected_sub_group
@@ -2830,7 +2857,7 @@ async def test_produce_scope_selection_stores_then_fetches_only_new_subset_via_s
 
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _selected_kwargs('Produce', '2025', '1', 'West', 'Extra'),
+        _selected_kwargs('Produce', 'West', '2025', '1', 'Extra'),
     )
     message.answer.assert_awaited_once_with(
         **Text(
@@ -2844,7 +2871,7 @@ async def test_produce_scope_selection_stores_then_fetches_only_new_subset_via_s
     assert [event[0] for event in clip_store.events] == ['store', 'store', 'compact', 'fetch']
     assert clip_store.fetch_calls == [
         (
-            ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
             ('id-1', 'id-2', 'id-3'),
         )
@@ -2899,7 +2926,7 @@ async def test_produce_scope_selection_with_no_new_clips_sends_summary_only() ->
 
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
-        _selected_kwargs('Produce', '2025', '1', 'West', 'Collection'),
+        _selected_kwargs('Produce', 'West', '2025', '1', 'Collection'),
     )
     message.answer.assert_awaited_once_with(**Text('Deduplicated: ', Bold('1')).as_kwargs())
     assert clip_store.fetch_calls == []
@@ -2995,7 +3022,7 @@ async def test_store_scope_selection_compacts_extra_and_source_batches(scope: Sc
     )
 
     clip_store.compact.assert_awaited_once_with(
-        clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
         clip_sub_group=ClipSubGroup(sub_season=SubSeason.NONE, scope=scope),
         batch_size=intake_module._TELEGRAM_MEDIA_GROUP_LIMIT,
     )
@@ -3123,7 +3150,7 @@ async def test_reconcile_scope_selection_uses_stored_filename_batches_without_do
         mode=FLOW_RECONCILE,
         menu_message_id=53,
         sub_season=SubSeason.NONE,
-        clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
         filename_batches=[['one.mp4'], ['two.mp4', 'three.mp4']],
         buffer_version=buffer.version(77),
     )
@@ -3143,7 +3170,7 @@ async def test_reconcile_scope_selection_uses_stored_filename_batches_without_do
 
     clip_store.reconcile.assert_awaited_once_with(
         [['one.mp4'], ['two.mp4', 'three.mp4']],
-        clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
         clip_sub_group=ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
     )
     bot.get_file.assert_not_awaited()
@@ -3262,7 +3289,7 @@ async def test_reconcile_scope_selection_becomes_stale_when_buffer_version_chang
         mode=FLOW_RECONCILE,
         menu_message_id=59,
         sub_season=SubSeason.NONE,
-        clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
         filename_batches=[['one.mp4']],
         buffer_version=buffer.version(77),
     )
@@ -3303,7 +3330,7 @@ async def test_reconcile_entry_skips_text_only_buffered_groups() -> None:
         chat_id=77,
     )
     clip_store = SimpleNamespace(
-        derive_group=AsyncMock(return_value=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST))
+        derive_group=AsyncMock(return_value=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1))
     )
     services = _services(clip_store=clip_store, buffer=buffer)
 
@@ -3330,7 +3357,7 @@ async def test_reconcile_entry_with_missing_video_filename_fails_cleanly_without
     callback = _fake_callback(message)
     state = _FakeState()
     await state.update_data(
-        clip_group=ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
         filename_batches=[['old-one.mp4']],
         buffer_version=0,
     )
@@ -3375,8 +3402,8 @@ async def test_reconcile_entry_with_missing_video_filename_fails_cleanly_without
         (
             MixedClipGroupsError(
                 groups=[
-                    ClipGroup(year=2024, season=Season.S1, universe=Universe.WEST),
-                    ClipGroup(year=2024, season=Season.S1, universe=Universe.EAST),
+                    ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+                    ClipGroup(universe=Universe.EAST, year=2024, season=Season.S1),
                 ]
             ),
             "Can't reconcile mixed groups",
@@ -3424,14 +3451,14 @@ async def test_send_stored_clip_batch_preserves_filename() -> None:
         bot=bot,
         chat_id=5,
         clips=[
-            Clip(filename='clips/2025-1-west/a.mp4', bytes=b'a'),
-            Clip(filename='clips/2025-1-west/b.mp4', bytes=b'b'),
+            Clip(filename='clips/west-2025-1/a.mp4', bytes=b'a'),
+            Clip(filename='clips/west-2025-1/b.mp4', bytes=b'b'),
         ],
     )
 
     media = bot.send_media_group.await_args.kwargs['media']
-    assert media[0].media.filename == 'clips/2025-1-west/a.mp4'
-    assert media[1].media.filename == 'clips/2025-1-west/b.mp4'
+    assert media[0].media.filename == 'clips/west-2025-1/a.mp4'
+    assert media[1].media.filename == 'clips/west-2025-1/b.mp4'
 
 
 @pytest.mark.asyncio
@@ -3441,10 +3468,10 @@ async def test_send_stored_clip_batch_sends_single_clip_as_video() -> None:
     await _send_stored_clip_batch(
         bot=bot,
         chat_id=5,
-        clips=[Clip(filename='clips/2025-1-west/a.mp4', bytes=b'a')],
+        clips=[Clip(filename='clips/west-2025-1/a.mp4', bytes=b'a')],
     )
 
-    assert bot.send_video.await_args.kwargs['video'].filename == 'clips/2025-1-west/a.mp4'
+    assert bot.send_video.await_args.kwargs['video'].filename == 'clips/west-2025-1/a.mp4'
     bot.send_media_group.assert_not_awaited()
 
 
@@ -3464,7 +3491,7 @@ async def test_send_retrieve_scopes_sends_separator_only_between_scope_blocks_an
         bot=bot,
         chat_id=9,
         services=services,
-        clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
         sub_season=SubSeason.NONE,
         scopes=[Scope.COLLECTION, Scope.EXTRA],
         settings=_settings(),
@@ -3473,12 +3500,12 @@ async def test_send_retrieve_scopes_sends_separator_only_between_scope_blocks_an
 
     assert services.clip_store.calls == [
         (
-            ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
             None,
         ),
         (
-            ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
             None,
         ),
@@ -3520,7 +3547,7 @@ async def test_send_retrieve_scopes_normalizes_clips_in_memory_before_send(
         bot=bot,
         chat_id=9,
         services=services,
-        clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+        clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
         sub_season=SubSeason.NONE,
         scopes=[Scope.COLLECTION],
         settings=_settings(normalization_loudness=-13, normalization_bitrate=160),
@@ -3566,7 +3593,7 @@ async def test_send_retrieve_scopes_propagates_normalization_failure_without_sen
             bot=bot,
             chat_id=9,
             services=services,
-            clip_group=ClipGroup(year=2025, season=Season.S1, universe=Universe.WEST),
+            clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             sub_season=SubSeason.NONE,
             scopes=[Scope.COLLECTION],
             settings=_settings(),

@@ -68,14 +68,17 @@ class Universe(StrEnum):
     WEST = 'west'
     EAST = 'east'
 
+    def order(self) -> int:
+        return tuple(type(self)).index(self)
+
 
 @dataclass(frozen=True, slots=True)
 class ClipGroup:
     """Logical clip-group identifier."""
 
+    universe: Universe
     year: int
     season: Season
-    universe: Universe
 
 
 class SubSeason(StrEnum):
@@ -351,19 +354,19 @@ class ClipGroupNotFoundError(LookupError):
     def __init__(
         self,
         *,
+        universe: Universe,
         year: int,
         season: Season,
-        universe: Universe,
         sub_season: SubSeason | None,
         scope: Scope | None,
     ) -> None:
+        self.universe = universe
         self.year = year
         self.season = season
-        self.universe = universe
         self.sub_season = sub_season
         self.scope = scope
         super().__init__(
-            f'No clips found for {year}-{int(season)}-{universe.value} '
+            f'No clips found for {universe.value}-{year}-{int(season)} '
             f'sub_season={_format_optional_sub_season(sub_season)} scope={_format_scope(scope)}'
         )
 
@@ -437,9 +440,9 @@ class ClipStore:
             RuntimeError: If clip hashing fails.
         """
         clip_group_prefix = self._clip_group_prefix(
+            universe=clip_group.universe,
             year=clip_group.year,
             season=clip_group.season,
-            universe=clip_group.universe,
         )
         manifest = await self._load_manifest_for_store(clip_group_prefix)
         seen_hashes: set[str] = set()
@@ -541,17 +544,17 @@ class ClipStore:
             raise ValueError('`batch_size` must be >= 1')
 
         clip_group_prefix = self._clip_group_prefix(
+            universe=clip_group.universe,
             year=clip_group.year,
             season=clip_group.season,
-            universe=clip_group.universe,
         )
         try:
             manifest = await self._load_manifest_for_read(clip_group_prefix)
         except S3ObjectNotFoundError as error:
             raise ClipGroupNotFoundError(
+                universe=clip_group.universe,
                 year=clip_group.year,
                 season=clip_group.season,
-                universe=clip_group.universe,
                 sub_season=None,
                 scope=None,
             ) from error
@@ -559,9 +562,9 @@ class ClipStore:
         target_entries = self._sorted_sub_group_entries(manifest, clip_sub_group)
         if not target_entries:
             raise ClipGroupNotFoundError(
+                universe=clip_group.universe,
                 year=clip_group.year,
                 season=clip_group.season,
-                universe=clip_group.universe,
                 sub_season=clip_sub_group.sub_season,
                 scope=clip_sub_group.scope,
             )
@@ -644,15 +647,15 @@ class ClipStore:
             raise MixedClipGroupsError(
                 groups=sorted(
                     parsed_groups,
-                    key=lambda group: (group.year, int(group.season), group.universe.value),
+                    key=lambda group: (group.universe.order(), group.year, int(group.season)),
                 )
             )
 
         clip_group = next(iter(parsed_groups))
         clip_group_prefix = self._clip_group_prefix(
+            universe=clip_group.universe,
             year=clip_group.year,
             season=clip_group.season,
-            universe=clip_group.universe,
         )
         try:
             manifest = await self._load_manifest_for_read(clip_group_prefix)
@@ -722,17 +725,17 @@ class ClipStore:
             raise ValueError('`filename_batches` must contain at least one filename')
 
         clip_group_prefix = self._clip_group_prefix(
+            universe=clip_group.universe,
             year=clip_group.year,
             season=clip_group.season,
-            universe=clip_group.universe,
         )
         try:
             manifest = await self._load_manifest_for_read(clip_group_prefix)
         except S3ObjectNotFoundError as error:
             raise ClipGroupNotFoundError(
+                universe=clip_group.universe,
                 year=clip_group.year,
                 season=clip_group.season,
-                universe=clip_group.universe,
                 sub_season=None,
                 scope=None,
             ) from error
@@ -839,17 +842,17 @@ class ClipStore:
             ClipIdsNotInSubGroupError: If `clip_ids` contains ids outside the requested subgroup.
         """
         clip_group_prefix = self._clip_group_prefix(
+            universe=clip_group.universe,
             year=clip_group.year,
             season=clip_group.season,
-            universe=clip_group.universe,
         )
         try:
             manifest = await self._load_manifest_for_read(clip_group_prefix)
         except S3ObjectNotFoundError as error:
             raise ClipGroupNotFoundError(
+                universe=clip_group.universe,
                 year=clip_group.year,
                 season=clip_group.season,
-                universe=clip_group.universe,
                 sub_season=None,
                 scope=None,
             ) from error
@@ -858,9 +861,9 @@ class ClipStore:
         if clip_ids is None:
             if not matching_entries:
                 raise ClipGroupNotFoundError(
+                    universe=clip_group.universe,
                     year=clip_group.year,
                     season=clip_group.season,
-                    universe=clip_group.universe,
                     sub_season=clip_sub_group.sub_season,
                     scope=clip_sub_group.scope,
                 )
@@ -897,23 +900,23 @@ class ClipStore:
         """List all discovered clip groups from stored S3 prefixes."""
         clip_group_prefixes = await self._s3_client.list_subprefixes(prefix=_CLIPS_PREFIX)
         clip_groups = [self._parse_clip_group_prefix(prefix) for prefix in clip_group_prefixes]
-        return sorted(clip_groups, key=lambda group: (group.year, int(group.season), group.universe.value))
+        return sorted(clip_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
 
     async def list_sub_groups(self, clip_group: ClipGroup) -> list[ClipSubGroup]:
         """List unique sub-groups for a clip group from its manifest."""
         clip_group_prefix = self._clip_group_prefix(
+            universe=clip_group.universe,
             year=clip_group.year,
             season=clip_group.season,
-            universe=clip_group.universe,
         )
 
         try:
             manifest = await self._load_manifest_for_read(clip_group_prefix)
         except S3ObjectNotFoundError as error:
             raise ClipGroupNotFoundError(
+                universe=clip_group.universe,
                 year=clip_group.year,
                 season=clip_group.season,
-                universe=clip_group.universe,
                 sub_season=None,
                 scope=None,
             ) from error
@@ -940,8 +943,8 @@ class ClipStore:
             key=lambda entry: (entry.batch, entry.order),
         )
 
-    def _clip_group_prefix(self, *, year: int, season: Season, universe: Universe) -> Prefix:
-        clip_group = _CLIP_GROUP_SEPARATOR.join((str(year), str(int(season)), universe.value))
+    def _clip_group_prefix(self, *, universe: Universe, year: int, season: Season) -> Prefix:
+        clip_group = _CLIP_GROUP_SEPARATOR.join((universe.value, str(year), str(int(season))))
         return S3Client.join(_CLIPS_PREFIX, clip_group)
 
     def _parse_clip_group_prefix(self, prefix: Prefix) -> ClipGroup:
@@ -955,14 +958,14 @@ class ClipStore:
 
         clip_group = remaining_segments[0]
         try:
-            year_text, season_text, universe_text = clip_group.split(_CLIP_GROUP_SEPARATOR)
+            universe_text, year_text, season_text = clip_group.split(_CLIP_GROUP_SEPARATOR)
+            universe = Universe(universe_text)
             year = int(year_text)
             season = Season(int(season_text))
-            universe = Universe(universe_text)
         except ValueError as error:
             raise ValueError(f'Invalid clip group prefix {prefix!r}: malformed clip group segment') from error
 
-        return ClipGroup(year=year, season=season, universe=universe)
+        return ClipGroup(universe=universe, year=year, season=season)
 
     def _manifest_key(self, clip_group_prefix: Prefix) -> Key:
         return S3Client.join(clip_group_prefix, _MANIFEST_FILENAME)

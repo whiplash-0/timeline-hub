@@ -54,18 +54,18 @@ async def validate_menu_flow_state(
 def flow_selection_labels(
     flow: FlowMenuDefinition,
     *,
+    universe: Universe | object = UNSET,
     year: int | object = UNSET,
     season: Season | object = UNSET,
-    universe: Universe | object = UNSET,
     sub_season: SubSeason | object = UNSET,
     scope: Scope | str | object = UNSET,
 ) -> list[str]:
     return [
         flow.flow_label,
         *selection_labels(
+            universe=universe,
             year=year,
             season=season,
-            universe=universe,
             sub_season=sub_season,
             scope=scope,
         ),
@@ -103,9 +103,9 @@ async def show_fixed_option_menu(
     available_options: Sequence[T],
     option_value: Callable[[T], str],
     option_text: Callable[[T], str],
+    universe: Universe | object = UNSET,
     year: int | object = UNSET,
     season: Season | object = UNSET,
-    universe: Universe | object = UNSET,
     sub_season: SubSeason | object = UNSET,
 ) -> None:
     await set_flow_context(
@@ -113,9 +113,9 @@ async def show_fixed_option_menu(
         mode=flow.mode,
         menu_message_id=message.message_id,
         fsm_state=flow.state_by_step[step],
+        universe=universe,
         year=year,
         season=season,
-        universe=universe,
         sub_season=sub_season,
     )
     await message.edit_text(
@@ -123,9 +123,9 @@ async def show_fixed_option_menu(
             prompt=prompt,
             selected=flow_selection_labels(
                 flow,
+                universe=universe,
                 year=year,
                 season=season,
-                universe=universe,
                 sub_season=sub_season,
             ),
             message_width=message_width,
@@ -157,6 +157,21 @@ async def show_or_stale(
     return False
 
 
+def selected_universe(data: Mapping[str, object]) -> Universe | None:
+    universe = data.get('universe')
+    if isinstance(universe, Universe):
+        return universe
+    return None
+
+
+def selected_universe_year(data: Mapping[str, object]) -> tuple[Universe, int] | None:
+    universe = selected_universe(data)
+    year = selected_year(data)
+    if universe is None or year is None:
+        return None
+    return universe, year
+
+
 def selected_year(data: Mapping[str, object]) -> int | None:
     year = data.get('year')
     if isinstance(year, int):
@@ -164,32 +179,24 @@ def selected_year(data: Mapping[str, object]) -> int | None:
     return None
 
 
-def selected_year_season(data: Mapping[str, object]) -> tuple[int, Season] | None:
-    year = selected_year(data)
+def selected_universe_year_season(data: Mapping[str, object]) -> tuple[Universe, int, Season] | None:
+    selection = selected_universe_year(data)
     season = data.get('season')
-    if year is None or not isinstance(season, Season):
+    if selection is None or not isinstance(season, Season):
         return None
-    return year, season
+    universe, year = selection
+    return universe, year, season
 
 
-def selected_year_season_universe(data: Mapping[str, object]) -> tuple[int, Season, Universe] | None:
-    selection = selected_year_season(data)
-    universe = data.get('universe')
-    if selection is None or not isinstance(universe, Universe):
-        return None
-    year, season = selection
-    return year, season, universe
-
-
-def selected_year_season_universe_sub_season(
+def selected_universe_year_season_sub_season(
     data: Mapping[str, object],
-) -> tuple[int, Season, Universe, SubSeason] | None:
-    selection = selected_year_season_universe(data)
+) -> tuple[Universe, int, Season, SubSeason] | None:
+    selection = selected_universe_year_season(data)
     sub_season = data.get('sub_season')
     if selection is None or not isinstance(sub_season, SubSeason):
         return None
-    year, season, universe = selection
-    return year, season, universe, sub_season
+    universe, year, season = selection
+    return universe, year, season, sub_season
 
 
 def year_option_universe(*, current_year: int, min_year: int) -> list[int]:
@@ -205,28 +212,20 @@ def store_allowed_seasons(*, year: int, today: date) -> list[Season]:
     return [season for season in Season if season <= max_season]
 
 
-def available_group_years(groups: Sequence[ClipGroup]) -> list[int]:
-    return sorted({group.year for group in groups})
+def available_group_years(groups: Sequence[ClipGroup], *, universe: Universe) -> list[int]:
+    return sorted({group.year for group in groups if group.universe is universe})
 
 
 def available_group_seasons(
     groups: Sequence[ClipGroup],
     *,
+    universe: Universe,
     year: int,
 ) -> list[Season]:
-    return [season for season in Season if any(group.year == year and group.season is season for group in groups)]
-
-
-def available_group_universes(
-    groups: Sequence[ClipGroup],
-    *,
-    year: int,
-    season: Season,
-) -> list[Universe]:
     return [
-        universe
-        for universe in Universe
-        if any(group.year == year and group.season is season and group.universe is universe for group in groups)
+        season
+        for season in Season
+        if any(group.universe is universe and group.year == year and group.season is season for group in groups)
     ]
 
 

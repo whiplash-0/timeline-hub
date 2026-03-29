@@ -135,9 +135,17 @@ If Back exists:
 - it occupies the entire bottom row
 - its position never changes
 
-### Snake layout
+### Option grid layouts
 
 The first two rows are a deterministic option grid.
+
+Two layouts are allowed:
+- snake layout
+- columnar right-to-left layout
+
+Use the layout already established for the specific flow. Do not switch an existing flow from one layout to the other unless the task explicitly requires that UI change.
+
+### Snake layout
 
 Snake rules:
 - start at the top-right corner
@@ -150,6 +158,18 @@ If the number of option slots is odd:
 - the first row contains one fewer slot than the second row
 
 Do not place options sequentially left-to-right.
+
+### Columnar right-to-left layout
+
+Columnar rules:
+- group options in input-order top/bottom pairs
+- treat each pair as one vertical column
+- render columns from right to left
+- preserve the fixed 3-row keyboard shape
+
+Example with `[1,2,3,4,5,6]`:
+- top row = `[5,3,1]`
+- middle row = `[6,4,2]`
 
 ## Fixed layout across flows
 
