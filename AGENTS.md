@@ -220,6 +220,10 @@ Pre-commit:
 - Do not bypass hooks.
 - If hooks fail, fix the issues before committing.
 - Ruff and Pyright must pass through the normal workflow.
+- After completing any coding task, run `uv run pre-commit run --all-files`.
+- Do not stop after tests, Ruff, or Pyright alone if pre-commit has not been run.
+- Treat a failing pre-commit run as unfinished work and fix the issues before handing the result back for review.
+- The final delivered state must pass pre-commit, not just targeted checks.
 
 ## Code style
 
