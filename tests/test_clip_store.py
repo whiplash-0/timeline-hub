@@ -120,10 +120,10 @@ def _manifest_bytes(entries: list[ManifestEntry]) -> bytes:
 
 
 def _patch_hashes(monkeypatch: pytest.MonkeyPatch, hashes: dict[bytes, str]) -> None:
-    async def _fake_hash(self: ClipStore, video_bytes: bytes) -> str:
+    async def _fake_hash(video_bytes: bytes) -> str:
         return hashes[video_bytes]
 
-    monkeypatch.setattr(ClipStore, '_hash_video_bytes', _fake_hash)
+    monkeypatch.setattr(clip_store_module, 'hash_video_content', _fake_hash)
 
 
 def _patch_uuid7(monkeypatch: pytest.MonkeyPatch, *clip_ids: str) -> None:

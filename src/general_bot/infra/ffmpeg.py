@@ -1,9 +1,90 @@
 import asyncio
+import hashlib
 import json
 import os
 import tempfile
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
+
+_HASH_READ_SIZE = 64 * 1024
+
+
+async def hash_video_content(
+    video_bytes: bytes,
+    *,
+    timeout: timedelta = timedelta(seconds=30),
+) -> str:
+    """Return a stable SHA-256 hash of the primary video stream content.
+
+    The hash is computed from ffmpeg's copied first video stream, excluding
+    audio, subtitles, and data streams.
+
+    Args:
+        video_bytes: Original MP4 video bytes.
+        timeout: Maximum time allowed for the ffmpeg subprocess run.
+    """
+    input_fd, input_name = tempfile.mkstemp(suffix='.mp4')
+    os.close(input_fd)
+    input_path = Path(input_name)
+
+    try:
+        input_path.write_bytes(video_bytes)
+
+        cmd = (
+            'ffmpeg',
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-nostats',
+            '-nostdin',
+            '-threads',
+            '1',
+            '-i',
+            str(input_path),
+            '-map',
+            '0:v:0',
+            '-c:v',
+            'copy',
+            '-an',
+            '-sn',
+            '-dn',
+            '-bsf:v',
+            'h264_mp4toannexb',
+            '-f',
+            'h264',
+            'pipe:1',
+        )
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        if proc.stdout is None or proc.stderr is None:
+            raise RuntimeError('ffmpeg subprocess did not expose stdout/stderr pipes')
+
+        hasher = hashlib.sha256()
+        try:
+            _, stderr, returncode = await asyncio.wait_for(
+                asyncio.gather(
+                    _hash_stream(proc.stdout, hasher),
+                    proc.stderr.read(),
+                    proc.wait(),
+                ),
+                timeout=timeout.total_seconds(),
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise
+
+        if returncode != 0:
+            raise RuntimeError(f'ffmpeg failed while hashing clip: {stderr.decode(errors="replace")}')
+
+        return hasher.hexdigest()
+    finally:
+        input_path.unlink(missing_ok=True)
 
 
 async def normalize_audio_loudness(
@@ -129,3 +210,8 @@ async def _run_ffmpeg(cmd: tuple[str, ...], timeout: timedelta) -> bytes:
         raise RuntimeError(f'ffmpeg failed: {stderr_text}')
 
     return stderr
+
+
+async def _hash_stream(stream: asyncio.StreamReader, hasher: Any) -> None:
+    while chunk := await stream.read(_HASH_READ_SIZE):
+        hasher.update(chunk)

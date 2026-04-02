@@ -1,24 +1,17 @@
-import asyncio
-import hashlib
 import itertools
 import json
-import os
-import tempfile
 import uuid
 from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
 from enum import IntEnum, StrEnum
-from pathlib import Path
 from typing import Any, Self, TypeVar
 
+from general_bot.infra.ffmpeg import hash_video_content
 from general_bot.infra.s3 import Key, Prefix, S3Client, S3ContentType, S3ObjectNotFoundError
 
 _CLIPS_PREFIX = 'clips'
 _MANIFEST_FILENAME = 'manifest.json'
 _VIDEO_SUFFIX = '.mp4'
-_FFMPEG_TIMEOUT = timedelta(seconds=30)
-_HASH_READ_SIZE = 64 * 1024
 _CLIP_GROUP_SEPARATOR = '-'
 # S3 keys often use '/' as delimiter, which is not safe for Telegram/local filenames.
 # This token replaces '/' when converting storage keys to portable filenames.
@@ -447,7 +440,7 @@ class ClipStore:
         uploaded_keys: list[Key] = []
         for clip in clips:
             stored_clip_id = self._parse_stored_clip_id(clip.filename)
-            video_hash = await self._hash_video_bytes(clip.bytes)
+            video_hash = await hash_video_content(clip.bytes)
 
             if stored_clip_id is not None and (manifest.has_id(stored_clip_id) or stored_clip_id in seen_ids):
                 duplicate_count += 1
@@ -1040,71 +1033,6 @@ class ClipStore:
         if failed_keys:
             raise ClipStoreRollbackError(failed_keys=failed_keys)
 
-    async def _hash_video_bytes(self, video_bytes: bytes) -> str:
-        input_fd, input_name = tempfile.mkstemp(suffix=_VIDEO_SUFFIX)
-        os.close(input_fd)
-        input_path = Path(input_name)
-
-        try:
-            input_path.write_bytes(video_bytes)
-            return await self._hash_video_path(input_path)
-        finally:
-            input_path.unlink(missing_ok=True)
-
-    async def _hash_video_path(self, input_path: Path) -> str:
-        cmd = (
-            'ffmpeg',
-            '-hide_banner',
-            '-loglevel',
-            'error',
-            '-nostats',
-            '-nostdin',
-            '-threads',
-            '1',
-            '-i',
-            str(input_path),
-            '-map',
-            '0:v:0',
-            '-c:v',
-            'copy',
-            '-an',
-            '-sn',
-            '-dn',
-            '-bsf:v',
-            'h264_mp4toannexb',
-            '-f',
-            'h264',
-            'pipe:1',
-        )
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        if proc.stdout is None or proc.stderr is None:
-            raise RuntimeError('ffmpeg subprocess did not expose stdout/stderr pipes')
-
-        hasher = hashlib.sha256()
-        try:
-            _, stderr, returncode = await asyncio.wait_for(
-                asyncio.gather(
-                    _hash_stream(proc.stdout, hasher),
-                    proc.stderr.read(),
-                    proc.wait(),
-                ),
-                timeout=_FFMPEG_TIMEOUT.total_seconds(),
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise
-
-        if returncode != 0:
-            raise RuntimeError(f'ffmpeg failed while hashing clip: {stderr.decode(errors="replace")}')
-
-        return hasher.hexdigest()
-
     @staticmethod
     def _s3_key_to_filename(storage_key: Key) -> str:
         return _FILENAME_S3_DELIMITER_ESCAPE.join(S3Client.split(storage_key))
@@ -1172,8 +1100,3 @@ def _format_optional_sub_season(sub_season: SubSeason | None) -> str:
 
 def _format_scope(scope: Scope | None) -> str:
     return 'None' if scope is None else scope.value
-
-
-async def _hash_stream(stream: asyncio.StreamReader, hasher: Any) -> None:
-    while chunk := await stream.read(_HASH_READ_SIZE):
-        hasher.update(chunk)
