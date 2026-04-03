@@ -267,6 +267,18 @@ Accepted risks:
 - stronger isolation or hard limits can be added after real incidents
 - maintenance speed and clarity take priority over defensive completeness
 
+Documentation of invariants:
+- Persist important architectural invariants and source-of-truth assumptions in docstrings near the owning class or function.
+- Document non-obvious contracts when a reasonable reviewer might otherwise infer the wrong behavior.
+- Prefer documenting the invariant once at the highest-value location (usually the owning class, core dataclass, or public method), not repeating it everywhere.
+- Especially document:
+  - what state is authoritative
+  - what is cache-like or derived
+  - intentional stale or unsynchronized states that may temporarily exist
+  - ordering and grouping guarantees
+  - single-writer or concurrency assumptions
+- Do not add generic or redundant docstrings; document only invariants that materially affect design, review, debugging, or future changes.
+
 ## Review expectations
 
 Reviews should evaluate:
