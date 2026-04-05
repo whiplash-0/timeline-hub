@@ -495,6 +495,45 @@ class ClipStore:
         self._s3_client = s3_client
         self._manifest_cache: dict[Prefix, Manifest] = {}
 
+    async def list_groups(self) -> list[ClipGroup]:
+        """List discovered clip groups from stored S3 prefixes.
+
+        This is prefix-based storage discovery, not a manifest-authoritative
+        existence check. After failed first writes, orphaned prefixes may
+        appear temporarily until manual cleanup removes them.
+        """
+        clip_group_prefixes = await self._s3_client.list_subprefixes(prefix=_CLIPS_PREFIX)
+        clip_groups = [self._parse_clip_group_prefix(prefix) for prefix in clip_group_prefixes]
+        return sorted(clip_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
+
+    async def list_sub_groups(self, group: ClipGroup) -> list[ClipSubGroup]:
+        """List unique sub-groups for a clip group from its manifest."""
+        clip_group_prefix = self._clip_group_prefix(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+        )
+
+        try:
+            manifest = await self._load_manifest_for_read(clip_group_prefix)
+        except S3ObjectNotFoundError as error:
+            raise ClipGroupNotFoundError(
+                universe=group.universe,
+                year=group.year,
+                season=group.season,
+                sub_season=None,
+                scope=None,
+            ) from error
+
+        sub_groups = {ClipSubGroup(entry.sub_season, entry.scope) for entry in manifest}
+        return sorted(
+            sub_groups,
+            key=lambda sub_group: (
+                sub_group.sub_season.order(),
+                sub_group.scope.value,
+            ),
+        )
+
     async def store(
         self,
         clips: Sequence[Clip],
@@ -621,29 +660,39 @@ class ClipStore:
             clip_ids=tuple(entry.id for entry, _ in new_entries),
         )
 
-    async def compact(
+    async def fetch(
         self,
         group: ClipGroup,
         sub_group: ClipSubGroup,
         *,
-        batch_size: int,
-    ) -> None:
-        """Compact one clip sub-group by rewriting manifest batch metadata only.
+        clip_ids: Sequence[ClipId] | None = None,
+        audio_normalization: AudioNormalization | None = None,
+    ) -> AsyncIterator[list[Clip]]:
+        """Fetch clips for a clip sub-group in preserved batch order.
 
-        Compaction preserves the exact subgroup-local relative order defined by
-        `(batch, order)` and rewrites only batching for the specified
-        `ClipSubGroup`. Clip objects are never downloaded, rewritten, or
-        re-uploaded. After compaction, target batch numbering is dense,
-        starts at `1`, and uses local `order` values `1..N` within each batch.
+        The iterator yields one list per stored batch. Batches are ordered by
+        increasing `batch`, and clips inside each batch are ordered by
+        increasing `order`. When `clip_ids` is provided, validation and
+        resolution are strictly local to the provided `(clip_group,
+        clip_sub_group)`. No cross-group or cross-subgroup lookup is
+        performed. Unknown ids are ids not present in the manifest of the
+        provided `clip_group`.
+
+        Validation precedence for `clip_ids` is:
+        1. Duplicate ids.
+        2. Ids missing from the clip-group manifest.
+        3. Ids not present in the requested subgroup.
+
+        Filtered results preserve the subgroup's canonical current manifest
+        order.
 
         Raises:
-            ValueError: If `batch_size` is less than `1`.
-            ClipGroupNotFoundError: If the requested clip group or sub-group has no clips.
+            ClipGroupNotFoundError: If the requested logical clip group has no matching clips.
+            DuplicateClipIdsError: If `clip_ids` contains duplicates.
             ManifestCorruptedError: If the clip-group manifest exists but is malformed.
+            UnknownClipsError: If `clip_ids` contains ids missing from the provided clip-group manifest.
+            ClipIdsNotInSubGroupError: If `clip_ids` contains ids outside the requested subgroup.
         """
-        if batch_size < 1:
-            raise ValueError('`batch_size` must be >= 1')
-
         clip_group_prefix = self._clip_group_prefix(
             universe=group.universe,
             year=group.year,
@@ -660,110 +709,55 @@ class ClipStore:
                 scope=None,
             ) from error
 
-        target_entries = self._sorted_sub_group_entries(manifest, sub_group)
-        if not target_entries:
-            raise ClipGroupNotFoundError(
-                universe=group.universe,
-                year=group.year,
-                season=group.season,
-                sub_season=sub_group.sub_season,
-                scope=sub_group.scope,
-            )
-
-        compacted_positions: dict[str, tuple[int, int]] = {}
-        changed = False
-        for index, entry in enumerate(target_entries, start=1):
-            compacted_batch = ((index - 1) // batch_size) + 1
-            compacted_order = ((index - 1) % batch_size) + 1
-            compacted_positions[entry.id] = (compacted_batch, compacted_order)
-            if (entry.batch, entry.order) != (compacted_batch, compacted_order):
-                changed = True
-
-        if not changed:
-            return
-
-        rewritten_entries: list[ManifestEntry] = []
-        for entry in manifest:
-            if entry.scope is sub_group.scope and entry.sub_season is sub_group.sub_season:
-                compacted_batch, compacted_order = compacted_positions[entry.id]
-                rewritten_entries.append(
-                    ManifestEntry(
-                        id=entry.id,
-                        video_hash=entry.video_hash,
-                        audio_normalization=entry.audio_normalization,
-                        sub_season=entry.sub_season,
-                        scope=entry.scope,
-                        batch=compacted_batch,
-                        order=compacted_order,
-                    )
+        matching_entries = self._sorted_sub_group_entries(manifest, sub_group)
+        if clip_ids is None:
+            if not matching_entries:
+                raise ClipGroupNotFoundError(
+                    universe=group.universe,
+                    year=group.year,
+                    season=group.season,
+                    sub_season=sub_group.sub_season,
+                    scope=sub_group.scope,
                 )
-            else:
-                rewritten_entries.append(entry)
+        else:
+            if len(set(clip_ids)) != len(clip_ids):
+                raise DuplicateClipIdsError(clip_ids=clip_ids)
 
-        rewritten_manifest = Manifest(rewritten_entries)
+            manifest_ids = {entry.id for entry in manifest}
+            unknown_ids = [clip_id for clip_id in clip_ids if clip_id not in manifest_ids]
+            if unknown_ids:
+                raise UnknownClipsError(clip_ids=unknown_ids)
 
-        # Compaction is manifest-only; clip objects stay untouched.
-        await self._write_manifest_and_update_cache(
-            clip_group_prefix=clip_group_prefix,
-            manifest=rewritten_manifest,
-        )
+            matching_ids = {entry.id for entry in matching_entries}
+            non_matching_ids = [clip_id for clip_id in clip_ids if clip_id not in matching_ids]
+            if non_matching_ids:
+                raise ClipIdsNotInSubGroupError(clip_ids=non_matching_ids)
 
-    async def derive_group(
-        self,
-        filename_batches: Sequence[Sequence[Filename]],
-    ) -> ClipGroup:
-        """Validate reconcile filenames and derive their single common clip group.
+            requested_ids = set(clip_ids)
+            # Output always follows current manifest ordering after any
+            # compaction; input `clip_ids` order does not affect it.
+            matching_entries = [entry for entry in matching_entries if entry.id in requested_ids]
 
-        Raises:
-            ValueError: If `filename_batches` is empty or all batches are empty.
-            DuplicateFilenamesError: If the provided filenames contain duplicates.
-            InvalidFilenamesError: If any filename is malformed or not a stored-style clip filename.
-            MixedClipGroupsError: If filenames refer to more than one clip group.
-            UnknownClipsError: If clip ids are missing from the derived group's manifest.
-            ManifestCorruptedError: If the derived clip-group manifest exists but is malformed.
-        """
-        if not filename_batches or all(not batch for batch in filename_batches):
-            raise ValueError('`filename_batches` must contain at least one filename')
+        # `groupby()` only forms correct batch groups because entries are
+        # sorted by `(batch, order)` immediately above.
+        for _, batch_entries in itertools.groupby(matching_entries, key=lambda entry: entry.batch):
+            batch_entries_list = list(batch_entries)
+            if audio_normalization is None:
+                clip_batch: list[Clip] = []
+                for entry in batch_entries_list:
+                    clip_key = self._clip_key(clip_group_prefix, entry.id)
+                    clip_bytes = await self._s3_client.get_bytes(clip_key)
+                    clip_batch.append(Clip(filename=self._s3_key_to_filename(clip_key), bytes=clip_bytes))
+                yield clip_batch
+                continue
 
-        flat_filenames = [filename for batch in filename_batches for filename in batch]
-        if len(set(flat_filenames)) != len(flat_filenames):
-            raise DuplicateFilenamesError('`filename_batches` must not contain duplicate filenames')
-
-        parsed_identities: list[tuple[ClipGroup, str]] = []
-        parsed_groups: set[ClipGroup] = set()
-        for filename in flat_filenames:
-            parsed_identity = self._parse_filename_identity(filename)
-            if parsed_identity is None:
-                raise InvalidFilenamesError(f'Filename is not a stored clip: {filename}')
-            clip_group, clip_id = parsed_identity
-            parsed_identities.append((clip_group, clip_id))
-            parsed_groups.add(clip_group)
-
-        if len(parsed_groups) != 1:
-            raise MixedClipGroupsError(
-                groups=sorted(
-                    parsed_groups,
-                    key=lambda group: (group.universe.order(), group.year, int(group.season)),
-                )
+            clip_batch, manifest = await self._fetch_normalized_batch(
+                clip_group_prefix,
+                manifest,
+                batch_entries_list,
+                audio_normalization=audio_normalization,
             )
-
-        clip_group = next(iter(parsed_groups))
-        clip_group_prefix = self._clip_group_prefix(
-            universe=clip_group.universe,
-            year=clip_group.year,
-            season=clip_group.season,
-        )
-        try:
-            manifest = await self._load_manifest_for_read(clip_group_prefix)
-        except S3ObjectNotFoundError as error:
-            raise UnknownClipsError(clip_ids=[clip_id for _, clip_id in parsed_identities]) from error
-
-        known_ids = {entry.id for entry in manifest}
-        unknown_ids = [clip_id for _, clip_id in parsed_identities if clip_id not in known_ids]
-        if unknown_ids:
-            raise UnknownClipsError(clip_ids=unknown_ids)
-
-        return clip_group
+            yield clip_batch
 
     async def reconcile(
         self,
@@ -911,39 +905,29 @@ class ClipStore:
             removed=len(removed_ids),
         )
 
-    async def fetch(
+    async def compact(
         self,
         group: ClipGroup,
         sub_group: ClipSubGroup,
         *,
-        clip_ids: Sequence[ClipId] | None = None,
-        audio_normalization: AudioNormalization | None = None,
-    ) -> AsyncIterator[list[Clip]]:
-        """Fetch clips for a clip sub-group in preserved batch order.
+        batch_size: int,
+    ) -> None:
+        """Compact one clip sub-group by rewriting manifest batch metadata only.
 
-        The iterator yields one list per stored batch. Batches are ordered by
-        increasing `batch`, and clips inside each batch are ordered by
-        increasing `order`. When `clip_ids` is provided, validation and
-        resolution are strictly local to the provided `(clip_group,
-        clip_sub_group)`. No cross-group or cross-subgroup lookup is
-        performed. Unknown ids are ids not present in the manifest of the
-        provided `clip_group`.
-
-        Validation precedence for `clip_ids` is:
-        1. Duplicate ids.
-        2. Ids missing from the clip-group manifest.
-        3. Ids not present in the requested subgroup.
-
-        Filtered results preserve the subgroup's canonical current manifest
-        order.
+        Compaction preserves the exact subgroup-local relative order defined by
+        `(batch, order)` and rewrites only batching for the specified
+        `ClipSubGroup`. Clip objects are never downloaded, rewritten, or
+        re-uploaded. After compaction, target batch numbering is dense,
+        starts at `1`, and uses local `order` values `1..N` within each batch.
 
         Raises:
-            ClipGroupNotFoundError: If the requested logical clip group has no matching clips.
-            DuplicateClipIdsError: If `clip_ids` contains duplicates.
+            ValueError: If `batch_size` is less than `1`.
+            ClipGroupNotFoundError: If the requested clip group or sub-group has no clips.
             ManifestCorruptedError: If the clip-group manifest exists but is malformed.
-            UnknownClipsError: If `clip_ids` contains ids missing from the provided clip-group manifest.
-            ClipIdsNotInSubGroupError: If `clip_ids` contains ids outside the requested subgroup.
         """
+        if batch_size < 1:
+            raise ValueError('`batch_size` must be >= 1')
+
         clip_group_prefix = self._clip_group_prefix(
             universe=group.universe,
             year=group.year,
@@ -960,94 +944,110 @@ class ClipStore:
                 scope=None,
             ) from error
 
-        matching_entries = self._sorted_sub_group_entries(manifest, sub_group)
-        if clip_ids is None:
-            if not matching_entries:
-                raise ClipGroupNotFoundError(
-                    universe=group.universe,
-                    year=group.year,
-                    season=group.season,
-                    sub_season=sub_group.sub_season,
-                    scope=sub_group.scope,
-                )
-        else:
-            if len(set(clip_ids)) != len(clip_ids):
-                raise DuplicateClipIdsError(clip_ids=clip_ids)
-
-            manifest_ids = {entry.id for entry in manifest}
-            unknown_ids = [clip_id for clip_id in clip_ids if clip_id not in manifest_ids]
-            if unknown_ids:
-                raise UnknownClipsError(clip_ids=unknown_ids)
-
-            matching_ids = {entry.id for entry in matching_entries}
-            non_matching_ids = [clip_id for clip_id in clip_ids if clip_id not in matching_ids]
-            if non_matching_ids:
-                raise ClipIdsNotInSubGroupError(clip_ids=non_matching_ids)
-
-            requested_ids = set(clip_ids)
-            # Output always follows current manifest ordering after any
-            # compaction; input `clip_ids` order does not affect it.
-            matching_entries = [entry for entry in matching_entries if entry.id in requested_ids]
-
-        # `groupby()` only forms correct batch groups because entries are
-        # sorted by `(batch, order)` immediately above.
-        for _, batch_entries in itertools.groupby(matching_entries, key=lambda entry: entry.batch):
-            batch_entries_list = list(batch_entries)
-            if audio_normalization is None:
-                clip_batch: list[Clip] = []
-                for entry in batch_entries_list:
-                    clip_key = self._clip_key(clip_group_prefix, entry.id)
-                    clip_bytes = await self._s3_client.get_bytes(clip_key)
-                    clip_batch.append(Clip(filename=self._s3_key_to_filename(clip_key), bytes=clip_bytes))
-                yield clip_batch
-                continue
-
-            clip_batch, manifest = await self._fetch_normalized_batch(
-                clip_group_prefix,
-                manifest,
-                batch_entries_list,
-                audio_normalization=audio_normalization,
+        target_entries = self._sorted_sub_group_entries(manifest, sub_group)
+        if not target_entries:
+            raise ClipGroupNotFoundError(
+                universe=group.universe,
+                year=group.year,
+                season=group.season,
+                sub_season=sub_group.sub_season,
+                scope=sub_group.scope,
             )
-            yield clip_batch
 
-    async def list_groups(self) -> list[ClipGroup]:
-        """List discovered clip groups from stored S3 prefixes.
+        compacted_positions: dict[str, tuple[int, int]] = {}
+        changed = False
+        for index, entry in enumerate(target_entries, start=1):
+            compacted_batch = ((index - 1) // batch_size) + 1
+            compacted_order = ((index - 1) % batch_size) + 1
+            compacted_positions[entry.id] = (compacted_batch, compacted_order)
+            if (entry.batch, entry.order) != (compacted_batch, compacted_order):
+                changed = True
 
-        This is prefix-based storage discovery, not a manifest-authoritative
-        existence check. After failed first writes, orphaned prefixes may
-        appear temporarily until manual cleanup removes them.
-        """
-        clip_group_prefixes = await self._s3_client.list_subprefixes(prefix=_CLIPS_PREFIX)
-        clip_groups = [self._parse_clip_group_prefix(prefix) for prefix in clip_group_prefixes]
-        return sorted(clip_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
+        if not changed:
+            return
 
-    async def list_sub_groups(self, group: ClipGroup) -> list[ClipSubGroup]:
-        """List unique sub-groups for a clip group from its manifest."""
-        clip_group_prefix = self._clip_group_prefix(
-            universe=group.universe,
-            year=group.year,
-            season=group.season,
+        rewritten_entries: list[ManifestEntry] = []
+        for entry in manifest:
+            if entry.scope is sub_group.scope and entry.sub_season is sub_group.sub_season:
+                compacted_batch, compacted_order = compacted_positions[entry.id]
+                rewritten_entries.append(
+                    ManifestEntry(
+                        id=entry.id,
+                        video_hash=entry.video_hash,
+                        audio_normalization=entry.audio_normalization,
+                        sub_season=entry.sub_season,
+                        scope=entry.scope,
+                        batch=compacted_batch,
+                        order=compacted_order,
+                    )
+                )
+            else:
+                rewritten_entries.append(entry)
+
+        rewritten_manifest = Manifest(rewritten_entries)
+
+        # Compaction is manifest-only; clip objects stay untouched.
+        await self._write_manifest_and_update_cache(
+            clip_group_prefix=clip_group_prefix,
+            manifest=rewritten_manifest,
         )
 
+    async def derive_group(
+        self,
+        filename_batches: Sequence[Sequence[Filename]],
+    ) -> ClipGroup:
+        """Validate reconcile filenames and derive their single common clip group.
+
+        Raises:
+            ValueError: If `filename_batches` is empty or all batches are empty.
+            DuplicateFilenamesError: If the provided filenames contain duplicates.
+            InvalidFilenamesError: If any filename is malformed or not a stored-style clip filename.
+            MixedClipGroupsError: If filenames refer to more than one clip group.
+            UnknownClipsError: If clip ids are missing from the derived group's manifest.
+            ManifestCorruptedError: If the derived clip-group manifest exists but is malformed.
+        """
+        if not filename_batches or all(not batch for batch in filename_batches):
+            raise ValueError('`filename_batches` must contain at least one filename')
+
+        flat_filenames = [filename for batch in filename_batches for filename in batch]
+        if len(set(flat_filenames)) != len(flat_filenames):
+            raise DuplicateFilenamesError('`filename_batches` must not contain duplicate filenames')
+
+        parsed_identities: list[tuple[ClipGroup, str]] = []
+        parsed_groups: set[ClipGroup] = set()
+        for filename in flat_filenames:
+            parsed_identity = self._parse_filename_identity(filename)
+            if parsed_identity is None:
+                raise InvalidFilenamesError(f'Filename is not a stored clip: {filename}')
+            clip_group, clip_id = parsed_identity
+            parsed_identities.append((clip_group, clip_id))
+            parsed_groups.add(clip_group)
+
+        if len(parsed_groups) != 1:
+            raise MixedClipGroupsError(
+                groups=sorted(
+                    parsed_groups,
+                    key=lambda group: (group.universe.order(), group.year, int(group.season)),
+                )
+            )
+
+        clip_group = next(iter(parsed_groups))
+        clip_group_prefix = self._clip_group_prefix(
+            universe=clip_group.universe,
+            year=clip_group.year,
+            season=clip_group.season,
+        )
         try:
             manifest = await self._load_manifest_for_read(clip_group_prefix)
         except S3ObjectNotFoundError as error:
-            raise ClipGroupNotFoundError(
-                universe=group.universe,
-                year=group.year,
-                season=group.season,
-                sub_season=None,
-                scope=None,
-            ) from error
+            raise UnknownClipsError(clip_ids=[clip_id for _, clip_id in parsed_identities]) from error
 
-        sub_groups = {ClipSubGroup(entry.sub_season, entry.scope) for entry in manifest}
-        return sorted(
-            sub_groups,
-            key=lambda sub_group: (
-                sub_group.sub_season.order(),
-                sub_group.scope.value,
-            ),
-        )
+        known_ids = {entry.id for entry in manifest}
+        unknown_ids = [clip_id for _, clip_id in parsed_identities if clip_id not in known_ids]
+        if unknown_ids:
+            raise UnknownClipsError(clip_ids=unknown_ids)
+
+        return clip_group
 
     @staticmethod
     def _sorted_sub_group_entries(manifest: Manifest, clip_sub_group: ClipSubGroup) -> list[ManifestEntry]:
