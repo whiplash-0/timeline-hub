@@ -118,6 +118,15 @@ class Track:
             raise ValueError('Track.cover_bytes must not be empty')
 
 
+@dataclass(frozen=True, slots=True)
+class TrackInfo:
+    """Public discovery metadata for one stored track within a specific sub-season."""
+
+    id: TrackId
+    artists: tuple[str, ...]
+    title: str
+
+
 class SubSeason(StrEnum):
     """Track sub-season identifier."""
 
@@ -830,6 +839,34 @@ class TrackStore:
         manifest = await self._require_group_manifest(group, sub_season=None)
         sub_seasons = {entry.sub_season for entry in manifest}
         return sorted(sub_seasons, key=lambda value: value.order())
+
+    async def list_tracks(self, group: TrackGroup, sub_season: SubSeason) -> list[TrackInfo]:
+        """List discovery metadata for tracks in one sub-season of a group.
+
+        Returned items are discovery metadata only. Results are ordered by the
+        authoritative manifest's ascending internal `order` within the
+        requested `sub_season`, but that internal `order` is intentionally not
+        exposed in the public return type.
+
+        Raises:
+            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+            TrackGroupNotFoundError: If the requested group manifest does not exist.
+            TrackManifestCorruptedError: If the group manifest exists but is malformed.
+        """
+        await self._ensure_presets_loaded()
+        manifest = await self._require_group_manifest(group, sub_season=sub_season)
+        entries = sorted(
+            (entry for entry in manifest if entry.sub_season is sub_season),
+            key=lambda entry: entry.order,
+        )
+        return [
+            TrackInfo(
+                id=entry.id,
+                artists=entry.artists,
+                title=entry.title,
+            )
+            for entry in entries
+        ]
 
     async def _ensure_presets_loaded(self) -> Presets:
         if self._presets_cache is not None:
