@@ -22,14 +22,13 @@ from general_bot.services.track_store import (
     TrackGroup,
     TrackGroupNotFoundError,
     TrackInfo,
-    TrackInstrumentalManifestSyncError,
     TrackInvalidAudioFormatError,
     TrackManifestCorruptedError,
     TrackManifestSyncError,
     TrackPresetsCorruptedError,
-    TrackReplaceManifestSyncError,
     TrackStore,
     TrackUniverse,
+    TrackUpdateManifestSyncError,
 )
 
 _UUID_1 = uuid.UUID('018f05c1-f1a3-7b34-8d29-1f53a1c9d0e1').hex
@@ -1612,7 +1611,7 @@ async def test_store_rejects_non_48k_audio_before_writes(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
-async def test_attach_instrumental_uploads_and_rewrites_manifest_for_existing_track(
+async def test_update_attaches_first_instrumental_uploads_and_rewrites_manifest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
@@ -1655,11 +1654,7 @@ async def test_attach_instrumental_uploads_and_rewrites_manifest_for_existing_tr
     )
     store = _store(s3_client)
 
-    await store.store_instrumental(
-        b'new-instrumental',
-        group=group,
-        track_id=_UUID_1,
-    )
+    await store.update(group, _UUID_1, instrumental_bytes=b'new-instrumental')
 
     assert s3_client.objects[instrumental_key] == b'new-instrumental'
     expected_manifest = _manifest_payload(
@@ -1695,7 +1690,7 @@ async def test_attach_instrumental_uploads_and_rewrites_manifest_for_existing_tr
 
 
 @pytest.mark.asyncio
-async def test_attach_instrumental_raises_for_unknown_track_id_in_group(
+async def test_update_instrumental_raises_for_unknown_track_id_in_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
@@ -1724,63 +1719,11 @@ async def test_attach_instrumental_raises_for_unknown_track_id_in_group(
     )
 
     with pytest.raises(ValueError, match=f'Track id {_UUID_2} does not exist in group'):
-        await store.store_instrumental(
-            b'instrumental',
-            group=group,
-            track_id=_UUID_2,
-        )
+        await store.update(group, _UUID_2, instrumental_bytes=b'instrumental')
 
 
 @pytest.mark.asyncio
-async def test_attach_instrumental_raises_when_instrumental_already_exists(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
-    probe_calls = _patch_probe_audio_sample_rate(monkeypatch)
-    manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
-    instrumental_key = _instrumental_key(
-        universe=TrackUniverse.WEST,
-        year=2026,
-        season=Season.S1,
-        track_id=_UUID_1,
-    )
-    s3_client = _FakeS3Client(
-        objects={
-            _presets_key(): _presets_bytes(),
-            manifest_key: _manifest_bytes(
-                [
-                    _entry(
-                        id=_UUID_1,
-                        artists=('artist',),
-                        title='title',
-                        sub_season=SubSeason.A,
-                        order=1,
-                        preset=None,
-                        has_instrumental=True,
-                        has_instrumental_variants=False,
-                    ),
-                ]
-            ),
-            instrumental_key: b'old-instrumental',
-        }
-    )
-    store = _store(s3_client)
-
-    with pytest.raises(ValueError, match=f'Instrumental already exists for track id {_UUID_1}'):
-        await store.store_instrumental(
-            b'new-instrumental',
-            group=group,
-            track_id=_UUID_1,
-        )
-
-    assert s3_client.objects[instrumental_key] == b'old-instrumental'
-    assert instrumental_key not in s3_client.get_calls
-    assert s3_client.list_subprefixes_calls == []
-    assert probe_calls == []
-
-
-@pytest.mark.asyncio
-async def test_attach_instrumental_raises_sync_error_and_keeps_uploaded_object_when_manifest_write_fails(
+async def test_update_first_instrumental_attach_wraps_manifest_write_failure_as_sync_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
@@ -1815,20 +1758,15 @@ async def test_attach_instrumental_raises_sync_error_and_keeps_uploaded_object_w
     )
     store = _store(s3_client)
 
-    with pytest.raises(
-        TrackInstrumentalManifestSyncError, match='Instrumental/manifest synchronization failed'
-    ) as excinfo:
-        await store.store_instrumental(
-            b'new-instrumental',
-            group=group,
-            track_id=_UUID_1,
-        )
+    with pytest.raises(TrackUpdateManifestSyncError, match='manifest_write') as excinfo:
+        await store.update(group, _UUID_1, instrumental_bytes=b'new-instrumental')
 
+    assert excinfo.value.stage == 'manifest_write'
     assert excinfo.value.track_id == _UUID_1
-    assert excinfo.value.instrumental_key == instrumental_key
+    assert excinfo.value.touched_keys == (instrumental_key,)
     assert excinfo.value.manifest_key == manifest_key
     assert getattr(excinfo.value, '__notes__', []) == [
-        f"Original manifest write error: RuntimeError('boom putting {manifest_key}')"
+        f"Update manifest write error: RuntimeError('boom putting {manifest_key}')"
     ]
     assert s3_client.objects[instrumental_key] == b'new-instrumental'
     assert s3_client.objects[manifest_key] == original_manifest_payload
@@ -1851,7 +1789,7 @@ async def test_attach_instrumental_raises_sync_error_and_keeps_uploaded_object_w
 
 
 @pytest.mark.asyncio
-async def test_attach_instrumental_rejects_non_48k_audio_before_writes(
+async def test_update_instrumental_rejects_non_48k_audio_before_writes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
@@ -1885,11 +1823,7 @@ async def test_attach_instrumental_rejects_non_48k_audio_before_writes(
     store = _store(s3_client)
 
     with pytest.raises(TrackInvalidAudioFormatError, match='Audio sample rate must be 48000 Hz, got 44100') as excinfo:
-        await store.store_instrumental(
-            b'bad-instrumental',
-            group=group,
-            track_id=_UUID_1,
-        )
+        await store.update(group, _UUID_1, instrumental_bytes=b'bad-instrumental')
 
     assert excinfo.value.track_id == _UUID_1
     assert excinfo.value.reason == 'Audio sample rate must be 48000 Hz, got 44100'
@@ -1899,7 +1833,7 @@ async def test_attach_instrumental_rejects_non_48k_audio_before_writes(
 
 
 @pytest.mark.asyncio
-async def test_replace_updates_only_manifest_metadata() -> None:
+async def test_update_updates_only_manifest_metadata() -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     original_entry = _entry(
@@ -1921,7 +1855,7 @@ async def test_replace_updates_only_manifest_metadata() -> None:
     )
     store = _store(s3_client)
 
-    await store.replace(
+    await store.update(
         group,
         _UUID_1,
         artists=('updated artist', 'guest'),
@@ -1947,7 +1881,7 @@ async def test_replace_updates_only_manifest_metadata() -> None:
 
 
 @pytest.mark.asyncio
-async def test_replace_cover_only_overwrites_cover_only() -> None:
+async def test_update_cover_only_overwrites_cover_only() -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
@@ -1972,7 +1906,7 @@ async def test_replace_cover_only_overwrites_cover_only() -> None:
     )
     store = _store(s3_client)
 
-    await store.replace(group, _UUID_1, cover_bytes=b'new-cover')
+    await store.update(group, _UUID_1, cover_bytes=b'new-cover')
 
     assert s3_client.objects[cover_key] == b'new-cover'
     assert s3_client.objects[manifest_key] == original_manifest
@@ -1980,7 +1914,7 @@ async def test_replace_cover_only_overwrites_cover_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_replace_audio_overwrites_track_deletes_variants_and_preserves_instrumental_state(
+async def test_update_audio_overwrites_track_deletes_variants_and_preserves_instrumental_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
@@ -2037,7 +1971,7 @@ async def test_replace_audio_overwrites_track_deletes_variants_and_preserves_ins
     )
     store = _store(s3_client)
 
-    await store.replace(group, _UUID_1, audio_bytes=b'new-track')
+    await store.update(group, _UUID_1, audio_bytes=b'new-track')
 
     assert probe_calls == [b'new-track']
     assert s3_client.delete_keys_calls == [original_variant_keys]
@@ -2061,7 +1995,7 @@ async def test_replace_audio_overwrites_track_deletes_variants_and_preserves_ins
 
 
 @pytest.mark.asyncio
-async def test_replace_audio_wraps_partial_variant_deletion_as_sync_error(
+async def test_update_audio_wraps_partial_variant_deletion_as_sync_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
@@ -2108,8 +2042,8 @@ async def test_replace_audio_wraps_partial_variant_deletion_as_sync_error(
     )
     store = _store(s3_client)
 
-    with pytest.raises(TrackReplaceManifestSyncError, match='original_variant_delete') as excinfo:
-        await store.replace(group, _UUID_1, audio_bytes=b'new-track')
+    with pytest.raises(TrackUpdateManifestSyncError, match='original_variant_delete') as excinfo:
+        await store.update(group, _UUID_1, audio_bytes=b'new-track')
 
     assert probe_calls == [b'new-track']
     assert excinfo.value.stage == 'original_variant_delete'
@@ -2138,10 +2072,16 @@ async def test_replace_audio_wraps_partial_variant_deletion_as_sync_error(
 
 
 @pytest.mark.asyncio
-async def test_replace_instrumental_requires_existing_instrumental(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_update_instrumental_first_attach_sets_manifest_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     probe_calls = _patch_probe_audio_sample_rate(monkeypatch)
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    instrumental_key = _instrumental_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=_UUID_1,
+    )
     s3_client = _FakeS3Client(
         objects={
             _presets_key(): _presets_bytes(),
@@ -2164,14 +2104,29 @@ async def test_replace_instrumental_requires_existing_instrumental(monkeypatch: 
     )
     store = _store(s3_client)
 
-    with pytest.raises(ValueError, match=f'Track id {_UUID_1} does not have an attached instrumental'):
-        await store.replace(group, _UUID_1, instrumental_bytes=b'new-instrumental')
+    await store.update(group, _UUID_1, instrumental_bytes=b'new-instrumental')
 
-    assert probe_calls == []
+    assert probe_calls == [b'new-instrumental']
+    assert s3_client.objects[instrumental_key] == b'new-instrumental'
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(
+                id=_UUID_1,
+                artists=('artist',),
+                title='title',
+                sub_season=SubSeason.A,
+                order=1,
+                preset=_applied_preset(),
+                has_variants=False,
+                has_instrumental=True,
+                has_instrumental_variants=False,
+            )
+        ]
+    )
 
 
 @pytest.mark.asyncio
-async def test_replace_instrumental_overwrites_authoritative_key_and_resets_variant_flag(
+async def test_update_instrumental_overwrites_authoritative_key_and_resets_variant_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
@@ -2230,7 +2185,7 @@ async def test_replace_instrumental_overwrites_authoritative_key_and_resets_vari
     )
     store = _store(s3_client)
 
-    await store.replace(group, _UUID_1, instrumental_bytes=b'new-instrumental')
+    await store.update(group, _UUID_1, instrumental_bytes=b'new-instrumental')
 
     assert probe_calls == [b'new-instrumental']
     assert s3_client.delete_keys_calls == [instrumental_variant_keys]
@@ -2254,7 +2209,7 @@ async def test_replace_instrumental_overwrites_authoritative_key_and_resets_vari
 
 
 @pytest.mark.asyncio
-async def test_replace_instrumental_wraps_partial_variant_deletion_as_sync_error(
+async def test_update_instrumental_wraps_partial_variant_deletion_as_sync_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
@@ -2308,8 +2263,8 @@ async def test_replace_instrumental_wraps_partial_variant_deletion_as_sync_error
     )
     store = _store(s3_client)
 
-    with pytest.raises(TrackReplaceManifestSyncError, match='instrumental_variant_delete') as excinfo:
-        await store.replace(group, _UUID_1, instrumental_bytes=b'new-instrumental')
+    with pytest.raises(TrackUpdateManifestSyncError, match='instrumental_variant_delete') as excinfo:
+        await store.update(group, _UUID_1, instrumental_bytes=b'new-instrumental')
 
     assert probe_calls == [b'new-instrumental']
     assert excinfo.value.stage == 'instrumental_variant_delete'
@@ -2338,7 +2293,7 @@ async def test_replace_instrumental_wraps_partial_variant_deletion_as_sync_error
 
 
 @pytest.mark.asyncio
-async def test_replace_rejects_missing_fields() -> None:
+async def test_update_rejects_missing_fields() -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     s3_client = _FakeS3Client(
@@ -2349,12 +2304,12 @@ async def test_replace_rejects_missing_fields() -> None:
     )
     store = _store(s3_client)
 
-    with pytest.raises(ValueError, match='replace\\(\\) requires at least one replacement field'):
-        await store.replace(group, _UUID_1)
+    with pytest.raises(ValueError, match='update\\(\\) requires at least one update field'):
+        await store.update(group, _UUID_1)
 
 
 @pytest.mark.asyncio
-async def test_replace_raises_sync_error_when_manifest_write_fails_after_cover_upload() -> None:
+async def test_update_raises_sync_error_when_manifest_write_fails_after_cover_upload() -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
@@ -2369,8 +2324,8 @@ async def test_replace_raises_sync_error_when_manifest_write_fails_after_cover_u
     )
     store = _store(s3_client)
 
-    with pytest.raises(TrackReplaceManifestSyncError, match='manifest_write') as excinfo:
-        await store.replace(group, _UUID_1, cover_bytes=b'new-cover')
+    with pytest.raises(TrackUpdateManifestSyncError, match='manifest_write') as excinfo:
+        await store.update(group, _UUID_1, cover_bytes=b'new-cover')
 
     assert excinfo.value.stage == 'manifest_write'
     assert excinfo.value.track_id == _UUID_1
@@ -2522,11 +2477,38 @@ async def test_fetch_with_explicit_preset_returns_current_original_and_instrumen
 
 
 @pytest.mark.asyncio
-async def test_fetch_with_unknown_preset_id_raises_value_error() -> None:
-    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
+async def test_fetch_with_unknown_preset_id_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation_calls = _patch_create_audio_variant(monkeypatch)
+
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    original_manifest = _manifest_bytes([_entry(id=_UUID_1, preset=_applied_preset(preset_id=1, version=3))])
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(
+                presets=[
+                    _sample_stored_presets()[1],
+                    _sample_stored_presets()[0],
+                ]
+            ),
+            manifest_key: original_manifest,
+            track_key: b'authoritative-track',
+            cover_key: b'cover',
+        }
+    )
+    store = _store(s3_client)
 
     with pytest.raises(ValueError, match='Unknown preset id: 99'):
-        await store.fetch(_track_group(), _UUID_1, preset_id=99)
+        await store.fetch(group, _UUID_1, preset_id=99)
+
+    assert generation_calls == []
+    assert s3_client.put_calls == []
+    assert s3_client.delete_keys_calls == []
+    assert s3_client.objects[manifest_key] == original_manifest
 
 
 @pytest.mark.asyncio
@@ -2562,7 +2544,7 @@ async def test_fetch_with_none_resolves_current_default_preset_and_returns_no_in
                         title='title',
                         sub_season=SubSeason.A,
                         order=1,
-                        preset=None,
+                        preset=_applied_preset(preset_id=99, version=1),
                         has_instrumental=False,
                         has_instrumental_variants=False,
                     ),
@@ -2584,6 +2566,21 @@ async def test_fetch_with_none_resolves_current_default_preset_and_returns_no_in
         (b'authoritative-track', 0.95, 0.02),
     ]
     assert isinstance(result, FetchedVariants)
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            _entry(
+                id=_UUID_1,
+                artists=('artist',),
+                title='title',
+                sub_season=SubSeason.A,
+                order=1,
+                preset=_applied_preset(preset_id=2, version=1, preset=_sample_stored_presets()[1].preset),
+                has_instrumental=False,
+                has_instrumental_variants=False,
+                has_variants=True,
+            )
+        ]
+    )
 
 
 @pytest.mark.asyncio

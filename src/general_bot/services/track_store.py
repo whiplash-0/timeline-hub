@@ -636,28 +636,8 @@ class TrackManifestSyncError(RuntimeError):
         )
 
 
-class TrackInstrumentalManifestSyncError(RuntimeError):
-    """Raised when instrumental uploads cannot be synchronized with manifest state."""
-
-    def __init__(
-        self,
-        *,
-        track_id: TrackId,
-        instrumental_key: Key,
-        manifest_key: Key,
-    ) -> None:
-        self.track_id = track_id
-        self.instrumental_key = instrumental_key
-        self.manifest_key = manifest_key
-        super().__init__(
-            'Instrumental/manifest synchronization failed '
-            f'for track id {self.track_id} after writing instrumental key {self.instrumental_key} '
-            f'but before persisting manifest key {self.manifest_key}'
-        )
-
-
-class TrackReplaceManifestSyncError(RuntimeError):
-    """Raised when staged replacement mutations cannot be synchronized with manifest state."""
+class TrackUpdateManifestSyncError(RuntimeError):
+    """Raised when staged update mutations cannot be synchronized with manifest state."""
 
     def __init__(
         self,
@@ -672,7 +652,7 @@ class TrackReplaceManifestSyncError(RuntimeError):
         self.touched_keys = tuple(touched_keys)
         self.manifest_key = manifest_key
         super().__init__(
-            f'Staged track replacement failed at {self.stage} for track id {self.track_id}; '
+            f'Staged track update failed at {self.stage} for track id {self.track_id}; '
             f'touched keys: {list(self.touched_keys)}; '
             f'manifest key not synchronized: {self.manifest_key}'
         )
@@ -701,7 +681,8 @@ class TrackStore:
     happen only after manifest persistence succeeds.
 
     This phase is intentionally conservative:
-        - `store()` writes only the original track and mandatory cover.
+        - `store()` creates new tracks and writes only the original track and mandatory cover.
+        - `update()` mutates authoritative components of existing tracks in place.
         - No hashing or deduplication is performed.
         - Concurrent writes to the same `TrackGroup` are unsupported.
         - `fetch()` returns generated variants only and may lazily regenerate stale caches.
@@ -895,92 +876,7 @@ class TrackStore:
             sync_error.add_note(f'Original manifest write error: {error!r}')
             raise sync_error from error
 
-    async def store_instrumental(
-        self,
-        instrumental_bytes: bytes,
-        *,
-        group: TrackGroup,
-        track_id: TrackId,
-    ) -> None:
-        """Store one track's first authoritative instrumental object.
-
-        This method only supports the first attach for the provided
-        `(group, track_id)`. Replacement is not allowed here. If an
-        instrumental already exists, callers must use
-        `replace(..., instrumental_bytes=...)`.
-
-        The upload happens before the manifest rewrite. If manifest persistence
-        fails, the uploaded instrumental is left in place and an explicit sync
-        error is raised for manual recovery.
-
-        Invariant:
-            All stored audio must have a sample rate of exactly 48_000 Hz.
-
-        Validation is strict and performed before any S3 writes. No resampling
-        is performed.
-
-        Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
-            TrackManifestCorruptedError: If the target group's manifest exists but is malformed.
-            TrackGroupNotFoundError: If the target group's manifest does not exist.
-            ValueError: If `track_id` does not exist in the provided group's manifest.
-            ValueError: If the target track already has an attached instrumental.
-            TrackInvalidAudioFormatError: If `instrumental_bytes` is not 48_000 Hz audio.
-            TrackInstrumentalManifestSyncError: If the instrumental is written but the manifest rewrite fails.
-        """
-        await self._ensure_presets_loaded()
-
-        track_group_prefix = self._track_group_prefix(
-            universe=group.universe,
-            year=group.year,
-            season=group.season,
-        )
-        manifest = (await self._require_group_manifest(group, sub_season=None)).copy()
-        entry = self._require_manifest_entry(manifest, group=group, track_id=track_id)
-        if entry.has_instrumental:
-            raise ValueError(
-                f'Instrumental already exists for track id {track_id}; use replace(..., instrumental_bytes=...)'
-            )
-        sample_rate = await probe_audio_sample_rate(instrumental_bytes)
-        if sample_rate != 48_000:
-            raise TrackInvalidAudioFormatError(
-                f'Audio sample rate must be 48000 Hz, got {sample_rate}',
-                track_id=track_id,
-            )
-
-        rewritten_manifest = self._replace_manifest_entry(
-            manifest,
-            updated_entry=dataclass_replace(
-                entry,
-                has_instrumental=True,
-                has_instrumental_variants=False,
-            ),
-        )
-
-        instrumental_key = self._instrumental_key(track_group_prefix, track_id)
-        manifest_key = self._manifest_key(track_group_prefix)
-
-        await self._s3_client.put_bytes(
-            instrumental_key,
-            instrumental_bytes,
-            content_type=S3ContentType.OPUS,
-        )
-
-        try:
-            await self._write_manifest_and_update_cache(
-                track_group_prefix=track_group_prefix,
-                manifest=rewritten_manifest,
-            )
-        except Exception as error:
-            sync_error = TrackInstrumentalManifestSyncError(
-                track_id=track_id,
-                instrumental_key=instrumental_key,
-                manifest_key=manifest_key,
-            )
-            sync_error.add_note(f'Original manifest write error: {error!r}')
-            raise sync_error from error
-
-    async def replace(
+    async def update(
         self,
         group: TrackGroup,
         track_id: TrackId,
@@ -988,12 +884,15 @@ class TrackStore:
         artists: tuple[str, ...] | None = None,
         title: str | None = None,
         audio_bytes: bytes | None = None,
-        cover_bytes: bytes | None = None,
         instrumental_bytes: bytes | None = None,
+        cover_bytes: bytes | None = None,
     ) -> None:
-        """Replace selected authoritative track components in place.
+        """Update selected authoritative track components in place.
 
-        Only provided fields are updated. Omitted fields remain unchanged.
+        This method mutates only the selected authoritative components for the
+        provided `(group, track_id)`. Omitted fields remain unchanged.
+        `instrumental_bytes` may either attach the first authoritative
+        instrumental or replace the existing one.
 
         Invariant:
             All stored audio must have a sample rate of exactly 48_000 Hz.
@@ -1006,26 +905,24 @@ class TrackStore:
             TrackManifestCorruptedError: If the target group's manifest exists but is malformed.
             TrackGroupNotFoundError: If the target group's manifest does not exist.
             ValueError: If `track_id` does not exist in the provided group's manifest.
-            ValueError: If no replacement fields are provided.
-            ValueError: If `instrumental_bytes` is provided for a track without an attached instrumental.
+            ValueError: If no update fields are provided.
             TrackInvalidAudioFormatError: If provided audio bytes are not 48_000 Hz audio.
-            TrackReplaceManifestSyncError: If one or more object mutations are applied but a later stage fails.
+            TrackUpdateManifestSyncError: If one or more object mutations are applied but a later stage fails.
         """
         await self._ensure_presets_loaded()
         if (
             artists is None
             and title is None
             and audio_bytes is None
-            and cover_bytes is None
             and instrumental_bytes is None
+            and cover_bytes is None
         ):
-            raise ValueError('replace() requires at least one replacement field')
+            raise ValueError('update() requires at least one update field')
 
-        validated_artists = self._validate_replacement_artists(artists)
-        validated_title = self._validate_replacement_title(title)
-        validated_cover_bytes = self._validate_replacement_cover_bytes(cover_bytes)
+        validated_artists = self._validate_update_artists(artists)
+        validated_title = self._validate_update_title(title)
 
-        # Resolve authoritative manifest state before validating track-bound audio replacements.
+        # Resolve authoritative manifest state before validating track-bound audio updates.
         track_group_prefix = self._track_group_prefix(
             universe=group.universe,
             year=group.year,
@@ -1034,17 +931,17 @@ class TrackStore:
         manifest = (await self._require_group_manifest(group, sub_season=None)).copy()
         entry = self._require_manifest_entry(manifest, group=group, track_id=track_id)
 
-        validated_audio_bytes = await self._validate_replacement_audio_bytes(audio_bytes, track_id=track_id)
-        validated_instrumental_bytes = await self._validate_replacement_instrumental_bytes(
+        validated_audio_bytes = await self._validate_update_audio_bytes(audio_bytes, track_id=track_id)
+        validated_instrumental_bytes = await self._validate_update_instrumental_bytes(
             instrumental_bytes,
             track_id=track_id,
-            has_instrumental=entry.has_instrumental,
         )
+        validated_cover_bytes = self._validate_update_cover_bytes(cover_bytes)
 
         # Set up the authoritative object keys and staged manifest state.
         track_key = self._track_key(track_group_prefix, track_id)
-        cover_key = self._cover_key(track_group_prefix, track_id)
         instrumental_key = self._instrumental_key(track_group_prefix, track_id)
+        cover_key = self._cover_key(track_group_prefix, track_id)
         manifest_key = self._manifest_key(track_group_prefix)
         touched_keys: list[Key] = []
         updated_entry = entry
@@ -1054,7 +951,7 @@ class TrackStore:
         if validated_title is not None:
             updated_entry = dataclass_replace(updated_entry, title=validated_title)
 
-        # Original track replacement invalidates only the original variant family.
+        # Original track updates invalidate only the original variant family.
         if validated_audio_bytes is not None and entry.has_variants:
             original_variant_keys = self._variant_storage_keys(
                 track_group_prefix=track_group_prefix,
@@ -1066,7 +963,7 @@ class TrackStore:
                 await self._s3_client.delete_keys(original_variant_keys)
             except Exception as error:
                 if (
-                    sync_error := self._build_replace_sync_error(
+                    sync_error := self._build_update_sync_error(
                         error,
                         stage='original_variant_delete',
                         track_id=track_id,
@@ -1089,7 +986,7 @@ class TrackStore:
                 )
             except Exception as error:
                 if (
-                    sync_error := self._build_replace_sync_error(
+                    sync_error := self._build_update_sync_error(
                         error,
                         stage='audio_upload',
                         track_id=track_id,
@@ -1103,7 +1000,7 @@ class TrackStore:
             touched_keys.append(track_key)
             updated_entry = dataclass_replace(updated_entry, has_variants=False)
 
-        # Instrumental replacement invalidates only the instrumental variant family.
+        # Instrumental updates invalidate only the instrumental variant family.
         if validated_instrumental_bytes is not None and entry.has_instrumental_variants:
             instrumental_variant_keys = self._variant_storage_keys(
                 track_group_prefix=track_group_prefix,
@@ -1115,7 +1012,7 @@ class TrackStore:
                 await self._s3_client.delete_keys(instrumental_variant_keys)
             except Exception as error:
                 if (
-                    sync_error := self._build_replace_sync_error(
+                    sync_error := self._build_update_sync_error(
                         error,
                         stage='instrumental_variant_delete',
                         track_id=track_id,
@@ -1138,7 +1035,7 @@ class TrackStore:
                 )
             except Exception as error:
                 if (
-                    sync_error := self._build_replace_sync_error(
+                    sync_error := self._build_update_sync_error(
                         error,
                         stage='instrumental_upload',
                         track_id=track_id,
@@ -1150,9 +1047,13 @@ class TrackStore:
                     raise
                 raise sync_error from error
             touched_keys.append(instrumental_key)
-            updated_entry = dataclass_replace(updated_entry, has_instrumental_variants=False)
+            updated_entry = dataclass_replace(
+                updated_entry,
+                has_instrumental=True,
+                has_instrumental_variants=False,
+            )
 
-        # Cover replacement does not affect variant state.
+        # Cover updates do not affect variant state.
         if validated_cover_bytes is not None:
             try:
                 await self._s3_client.put_bytes(
@@ -1162,7 +1063,7 @@ class TrackStore:
                 )
             except Exception as error:
                 if (
-                    sync_error := self._build_replace_sync_error(
+                    sync_error := self._build_update_sync_error(
                         error,
                         stage='cover_upload',
                         track_id=track_id,
@@ -1188,13 +1089,13 @@ class TrackStore:
             )
         except Exception as error:
             if (
-                sync_error := self._build_replace_sync_error(
+                sync_error := self._build_update_sync_error(
                     error,
                     stage='manifest_write',
                     track_id=track_id,
                     touched_keys=touched_keys,
                     manifest_key=manifest_key,
-                    note_prefix='Replacement manifest write error',
+                    note_prefix='Update manifest write error',
                 )
             ) is None:
                 raise
@@ -1248,8 +1149,10 @@ class TrackStore:
         manifest = await self._require_group_manifest(group, sub_season=None)
         entry = self._require_manifest_entry(manifest, group=group, track_id=track_id)
 
-        resolved_preset_id = preset_id if preset_id is not None else entry.preset.id
-        resolved_stored_preset = presets.get(resolved_preset_id) or presets.default_preset()
+        if preset_id is not None:
+            resolved_stored_preset = presets.require(preset_id)
+        else:
+            resolved_stored_preset = presets.get(entry.preset.id) or presets.default_preset()
 
         cover_key = self._cover_key(track_group_prefix, track_id)
         cover_bytes = await self._s3_client.get_bytes(cover_key)
@@ -1790,7 +1693,7 @@ class TrackStore:
             for index in range(1, variant_count + 1)
         ]
 
-    def _validate_replacement_artists(self, artists: tuple[str, ...] | None) -> tuple[str, ...] | None:
+    def _validate_update_artists(self, artists: tuple[str, ...] | None) -> tuple[str, ...] | None:
         if artists is None:
             return None
         if not isinstance(artists, tuple):
@@ -1803,7 +1706,7 @@ class TrackStore:
             raise ValueError('artists entries must be non-empty strings')
         return artists
 
-    def _validate_replacement_title(self, title: str | None) -> str | None:
+    def _validate_update_title(self, title: str | None) -> str | None:
         if title is None:
             return None
         if not isinstance(title, str):
@@ -1812,7 +1715,7 @@ class TrackStore:
             raise ValueError('title must be a non-empty string')
         return title
 
-    def _validate_replacement_cover_bytes(self, cover_bytes: bytes | None) -> bytes | None:
+    def _validate_update_cover_bytes(self, cover_bytes: bytes | None) -> bytes | None:
         if cover_bytes is None:
             return None
         if not isinstance(cover_bytes, bytes):
@@ -1821,7 +1724,7 @@ class TrackStore:
             raise ValueError('cover_bytes must not be empty')
         return cover_bytes
 
-    async def _validate_replacement_audio_bytes(
+    async def _validate_update_audio_bytes(
         self,
         audio_bytes: bytes | None,
         *,
@@ -1842,17 +1745,14 @@ class TrackStore:
             )
         return audio_bytes
 
-    async def _validate_replacement_instrumental_bytes(
+    async def _validate_update_instrumental_bytes(
         self,
         instrumental_bytes: bytes | None,
         *,
         track_id: TrackId,
-        has_instrumental: bool,
     ) -> bytes | None:
         if instrumental_bytes is None:
             return None
-        if not has_instrumental:
-            raise ValueError(f'Track id {track_id} does not have an attached instrumental')
         if not isinstance(instrumental_bytes, bytes):
             raise ValueError('instrumental_bytes must be bytes')
         if not instrumental_bytes:
@@ -1866,7 +1766,7 @@ class TrackStore:
             )
         return instrumental_bytes
 
-    def _build_replace_sync_error(
+    def _build_update_sync_error(
         self,
         error: Exception,
         *,
@@ -1876,12 +1776,12 @@ class TrackStore:
         assume_touched_keys: Iterable[Key] | None = None,
         manifest_key: Key,
         note_prefix: str,
-    ) -> TrackReplaceManifestSyncError | None:
+    ) -> TrackUpdateManifestSyncError | None:
         effective_keys = tuple(touched_keys) if touched_keys else tuple(assume_touched_keys or ())
         if not effective_keys:
             return None
 
-        sync_error = TrackReplaceManifestSyncError(
+        sync_error = TrackUpdateManifestSyncError(
             stage=stage,
             track_id=track_id,
             touched_keys=effective_keys,
