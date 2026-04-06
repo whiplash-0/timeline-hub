@@ -230,17 +230,17 @@ class PresetRecord:
     def __post_init__(self) -> None:
         """Validate stored preset invariants for all construction paths."""
         if isinstance(self.id, bool) or not isinstance(self.id, int):
-            raise ValueError('StoredPreset.id must be an integer')
+            raise ValueError('PresetRecord.id must be an integer')
         if self.id < 1:
-            raise ValueError('StoredPreset.id must be >= 1')
+            raise ValueError('PresetRecord.id must be >= 1')
 
         if isinstance(self.version, bool) or not isinstance(self.version, int):
-            raise ValueError('StoredPreset.version must be an integer')
+            raise ValueError('PresetRecord.version must be an integer')
         if self.version < 1:
-            raise ValueError('StoredPreset.version must be >= 1')
+            raise ValueError('PresetRecord.version must be >= 1')
 
         if not isinstance(self.preset, Preset):
-            raise ValueError('StoredPreset.preset must be a Preset')
+            raise ValueError('PresetRecord.preset must be a Preset')
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,10 +277,23 @@ class AppliedPreset:
 
 @dataclass(frozen=True, slots=True)
 class Presets:
-    """Authoritative preset registry stored at `tracks/presets.json`."""
+    """Authoritative preset registry stored at `tracks/presets.json`.
 
-    default_preset_id: PresetId
+    Invariants:
+    - `presets` must not be empty.
+    - The default preset is always stored at index 0 of `presets`.
+    """
+
     presets: list[PresetRecord]
+
+    def __post_init__(self) -> None:
+        """Validate preset collection invariants for all construction paths."""
+        if not isinstance(self.presets, list):
+            raise ValueError('Presets.presets must be a list')
+        if not self.presets:
+            raise ValueError('Presets.presets must not be empty')
+        if any(not isinstance(preset, PresetRecord) for preset in self.presets):
+            raise ValueError('Presets.presets entries must be PresetRecord instances')
 
     def get(self, preset_id: PresetId) -> PresetRecord | None:
         """Return the stored preset with the given id, if present."""
@@ -295,25 +308,22 @@ class Presets:
 
     def default_preset(self) -> PresetRecord:
         """Return the current default stored preset."""
-        return self.require(self.default_preset_id)
+        return self.presets[0]
 
-    def to_dict(self) -> dict[str, object]:
-        """Convert presets into their JSON-compatible storage shape."""
-        return {
-            'default_preset_id': self.default_preset_id,
-            'presets': [
-                {
-                    'id': preset.id,
-                    'version': preset.version,
-                    'preset': _preset_to_dict(preset.preset),
-                }
-                for preset in self.presets
-            ],
-        }
+    def to_list(self) -> list[dict[str, object]]:
+        """Convert presets into their JSON-compatible storage list shape."""
+        return [
+            {
+                'id': preset.id,
+                'version': preset.version,
+                'preset': _preset_to_dict(preset.preset),
+            }
+            for preset in self.presets
+        ]
 
     @classmethod
-    def from_dict(cls, data: object) -> Self:
-        """Build presets from a decoded JSON payload.
+    def from_list(cls, data: object) -> Self:
+        """Build presets from a decoded JSON list payload.
 
         Args:
             data: Decoded JSON value from `tracks/presets.json`.
@@ -321,26 +331,14 @@ class Presets:
         Raises:
             ValueError: If the payload does not match the preset schema.
         """
-        if not isinstance(data, dict):
-            raise ValueError('presets root must be an object')
-        if set(data) != {'default_preset_id', 'presets'}:
-            raise ValueError('presets root has unexpected fields')
-
-        default_preset_id = _expect_positive_int(
-            data['default_preset_id'],
-            field='default_preset_id',
-            context='presets',
-        )
-
-        raw_presets = data['presets']
-        if not isinstance(raw_presets, list):
-            raise ValueError('presets `presets` must be a list')
-        if not raw_presets:
-            raise ValueError('presets `presets` must not be empty')
+        if not isinstance(data, list):
+            raise ValueError('presets root must be a list')
+        if not data:
+            raise ValueError('presets root must not be empty')
 
         presets: list[PresetRecord] = []
         seen_ids: set[int] = set()
-        for raw_preset in raw_presets:
+        for raw_preset in data:
             if not isinstance(raw_preset, dict):
                 raise ValueError('presets preset entry must be an object')
             if set(raw_preset) != {'id', 'version', 'preset'}:
@@ -366,11 +364,7 @@ class Presets:
                 )
             )
 
-        if default_preset_id not in seen_ids:
-            raise ValueError('presets `default_preset_id` must refer to an existing preset')
-
         return cls(
-            default_preset_id=default_preset_id,
             presets=presets,
         )
 
@@ -559,6 +553,10 @@ class TrackPresetsCorruptedError(RuntimeError):
     def __init__(self, key: Key, reason: str) -> None:
         self.key = key
         super().__init__(f'Track presets at {key} are corrupted: {reason}')
+
+
+class TrackDefaultPresetRemovalError(ValueError):
+    """Raised when attempting to remove the current default preset."""
 
 
 class TrackGroupNotFoundError(LookupError):
@@ -1077,10 +1075,6 @@ class TrackStore:
         presets = await self._ensure_presets_loaded()
         return list(presets.presets)
 
-    async def get_default_preset(self) -> PresetRecord:
-        presets = await self._ensure_presets_loaded()
-        return presets.default_preset()
-
     async def add_preset(self, preset: Preset) -> None:
         """Append a new stored preset record.
 
@@ -1090,7 +1084,6 @@ class TrackStore:
         presets = await self._ensure_presets_loaded()
         next_preset_id = self._next_preset_id(presets)
         updated_presets = Presets(
-            default_preset_id=presets.default_preset_id,
             presets=[
                 *presets.presets,
                 PresetRecord(
@@ -1112,7 +1105,6 @@ class TrackStore:
         presets = await self._ensure_presets_loaded()
         stored_preset = presets.require(preset_id)
         updated_presets = Presets(
-            default_preset_id=presets.default_preset_id,
             presets=[
                 PresetRecord(
                     id=stored_preset.id,
@@ -1127,44 +1119,59 @@ class TrackStore:
         await self._write_presets_and_update_cache(updated_presets)
 
     async def set_default_preset(self, preset_id: PresetId) -> None:
-        """Set the authoritative default preset id.
+        """Move the selected preset to the default position at index 0.
 
         Raises:
             TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
             ValueError: If `preset_id` does not refer to a known preset.
         """
-        validated_preset_id = _expect_positive_int(preset_id, field='preset_id', context='set_default_preset')
-        presets = await self._ensure_presets_loaded()
-        presets.require(validated_preset_id)
-        updated_presets = Presets(
-            default_preset_id=validated_preset_id,
-            presets=list(presets.presets),
+        validated_preset_id = _expect_positive_int(
+            preset_id,
+            field='preset_id',
+            context='set_default_preset',
         )
+
+        presets = await self._ensure_presets_loaded()
+        target = presets.require(validated_preset_id)
+        if presets.default_preset().id == target.id:
+            return
+
+        # Reorder: move selected preset to front, preserve order of others
+        reordered = [target] + [preset for preset in presets.presets if preset.id != validated_preset_id]
+
+        updated_presets = Presets(
+            presets=reordered,
+        )
+
         await self._write_presets_and_update_cache(updated_presets)
 
     async def remove_preset(self, preset_id: PresetId) -> None:
-        """Remove one stored preset while keeping storage non-empty.
+        """Remove one non-default stored preset.
 
-        At least one preset must remain in storage, so removing the last
-        remaining preset is rejected.
+        The default preset cannot be removed.
 
         Raises:
             TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
-            ValueError: If `preset_id` does not refer to a known preset or removal would leave no presets.
+            ValueError: If `preset_id` does not refer to a known preset.
+            TrackDefaultPresetRemovalError: If `preset_id` refers to the current default preset.
         """
+        validated_preset_id = _expect_positive_int(
+            preset_id,
+            field='preset_id',
+            context='remove_preset',
+        )
+
         presets = await self._ensure_presets_loaded()
-        presets.require(preset_id)
+        target = presets.require(validated_preset_id)
 
-        remaining_presets = [stored_preset for stored_preset in presets.presets if stored_preset.id != preset_id]
-        if not remaining_presets:
-            raise ValueError('Cannot remove the last remaining preset')
+        if target.id == presets.default_preset().id:
+            raise TrackDefaultPresetRemovalError(f'Cannot remove default preset: {validated_preset_id}')
 
-        default_preset_id = presets.default_preset_id
-        if preset_id == presets.default_preset_id:
-            default_preset_id = min(stored_preset.id for stored_preset in remaining_presets)
+        remaining_presets = [
+            stored_preset for stored_preset in presets.presets if stored_preset.id != validated_preset_id
+        ]
 
         updated_presets = Presets(
-            default_preset_id=default_preset_id,
             presets=remaining_presets,
         )
         await self._write_presets_and_update_cache(updated_presets)
@@ -1180,7 +1187,7 @@ class TrackStore:
             presets = self._bootstrap_presets()
             await self._s3_client.put_bytes(
                 presets_key,
-                json.dumps(presets.to_dict(), separators=(',', ':')).encode('utf-8'),
+                json.dumps(presets.to_list(), separators=(',', ':')).encode('utf-8'),
                 content_type=S3ContentType.JSON,
             )
             self._presets_cache = presets
@@ -1188,7 +1195,7 @@ class TrackStore:
 
         try:
             decoded_presets = json.loads(raw_presets.decode('utf-8'))
-            presets = Presets.from_dict(decoded_presets)
+            presets = Presets.from_list(decoded_presets)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise TrackPresetsCorruptedError(presets_key, str(error)) from error
 
@@ -1202,20 +1209,18 @@ class TrackStore:
             preset=self._bootstrap_preset,
         )
         return Presets(
-            default_preset_id=1,
             presets=[bootstrap_preset],
         )
 
     async def _write_presets_and_update_cache(self, presets: Presets) -> None:
         presets_key = self._presets_key()
-        presets_payload = json.dumps(presets.to_dict(), separators=(',', ':')).encode('utf-8')
+        presets_payload = json.dumps(presets.to_list(), separators=(',', ':')).encode('utf-8')
         await self._s3_client.put_bytes(
             presets_key,
             presets_payload,
             content_type=S3ContentType.JSON,
         )
         self._presets_cache = Presets(
-            default_preset_id=presets.default_preset_id,
             presets=list(presets.presets),
         )
 

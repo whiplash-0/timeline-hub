@@ -206,12 +206,11 @@ def _sample_stored_presets() -> list[PresetRecord]:
     ]
 
 
-def _presets_bytes(*, default_preset_id: int = 1, presets: list[PresetRecord] | None = None) -> bytes:
+def _presets_bytes(*, presets: list[PresetRecord] | None = None) -> bytes:
     return json.dumps(
         Presets(
-            default_preset_id=default_preset_id,
             presets=list(presets or _sample_stored_presets()),
-        ).to_dict(),
+        ).to_list(),
         separators=(',', ':'),
     ).encode('utf-8')
 
@@ -263,11 +262,11 @@ def test_season_from_month_uses_exact_mapping() -> None:
     assert Season.from_month(12) is Season.S5
 
 
-def test_presets_from_dict_accepts_stored_wrapper_shape() -> None:
-    parsed = Presets.from_dict(json.loads(_presets_bytes(default_preset_id=2).decode('utf-8')))
+def test_presets_from_list_accepts_new_bare_list_schema() -> None:
+    parsed = Presets.from_list(json.loads(_presets_bytes().decode('utf-8')))
 
-    assert parsed.default_preset_id == 2
     assert [preset.id for preset in parsed.presets] == [1, 2]
+    assert parsed.default_preset() == parsed.presets[0]
     assert parsed.presets[1].version == 1
     assert parsed.presets[1].preset.name == 'soft'
     assert parsed.presets[1].preset.sped_up is None
@@ -332,11 +331,11 @@ def test_track_rejects_invalid_fields(kwargs: dict[str, object], message: str) -
 @pytest.mark.parametrize(
     ('kwargs', 'message'),
     [
-        ({'id': 0, 'version': 1}, 'StoredPreset.id must be >= 1'),
-        ({'id': 1, 'version': 0}, 'StoredPreset.version must be >= 1'),
+        ({'id': 0, 'version': 1}, 'PresetRecord.id must be >= 1'),
+        ({'id': 1, 'version': 0}, 'PresetRecord.version must be >= 1'),
     ],
 )
-def test_stored_preset_rejects_non_positive_identity_fields(
+def test_preset_record_rejects_non_positive_identity_fields(
     kwargs: dict[str, int],
     message: str,
 ) -> None:
@@ -349,41 +348,42 @@ def test_stored_preset_rejects_non_positive_identity_fields(
 
 
 def test_presets_reject_duplicate_stored_preset_ids() -> None:
-    payload = {
-        'default_preset_id': 1,
-        'presets': [
-            {
-                'id': 1,
-                'version': 1,
-                'preset': {
-                    'name': 'default',
-                    'slowed': {'step': 0.01, 'levels': 1},
-                    'sped_up': None,
-                    'reverb_start': 0.0,
-                    'reverb_step': 0.0,
-                },
+    payload = [
+        {
+            'id': 1,
+            'version': 1,
+            'preset': {
+                'name': 'default',
+                'slowed': {'step': 0.01, 'levels': 1},
+                'sped_up': None,
+                'reverb_start': 0.0,
+                'reverb_step': 0.0,
             },
-            {
-                'id': 1,
-                'version': 2,
-                'preset': {
-                    'name': 'other',
-                    'slowed': {'step': 0.02, 'levels': 1},
-                    'sped_up': None,
-                    'reverb_start': 0.1,
-                    'reverb_step': 0.1,
-                },
+        },
+        {
+            'id': 1,
+            'version': 2,
+            'preset': {
+                'name': 'other',
+                'slowed': {'step': 0.02, 'levels': 1},
+                'sped_up': None,
+                'reverb_start': 0.1,
+                'reverb_step': 0.1,
             },
-        ],
-    }
+        },
+    ]
 
     with pytest.raises(ValueError, match='duplicate stored preset id'):
-        Presets.from_dict(payload)
+        Presets.from_list(payload)
 
 
-def test_presets_reject_unknown_default_preset_id() -> None:
+def test_presets_reject_empty_list_construction() -> None:
+    with pytest.raises(ValueError, match='Presets.presets must not be empty'):
+        Presets(presets=[])
+
+
+def test_presets_from_list_rejects_old_object_root_schema() -> None:
     payload = {
-        'default_preset_id': 9,
         'presets': [
             {
                 'id': 1,
@@ -399,22 +399,20 @@ def test_presets_reject_unknown_default_preset_id() -> None:
         ],
     }
 
-    with pytest.raises(ValueError, match='default_preset_id'):
-        Presets.from_dict(payload)
+    with pytest.raises(ValueError, match='presets root must be a list'):
+        Presets.from_list(payload)
 
 
 def test_presets_default_preset_returns_stored_preset() -> None:
     presets = Presets(
-        default_preset_id=2,
         presets=_sample_stored_presets(),
     )
 
-    assert presets.default_preset() == presets.presets[1]
+    assert presets.default_preset() == presets.presets[0]
 
 
 def test_presets_serialization_preserves_insertion_order() -> None:
     original = Presets(
-        default_preset_id=2,
         presets=[
             _stored_preset(
                 preset_id=2,
@@ -441,10 +439,10 @@ def test_presets_serialization_preserves_insertion_order() -> None:
         ],
     )
 
-    parsed = Presets.from_dict(original.to_dict())
+    parsed = Presets.from_list(original.to_list())
 
     assert [preset.id for preset in parsed.presets] == [2, 1]
-    assert parsed.to_dict() == original.to_dict()
+    assert parsed.to_list() == original.to_list()
 
 
 def test_manifest_uses_top_level_list_with_preferred_field_order() -> None:
@@ -760,31 +758,27 @@ async def test_public_methods_bootstrap_presets_from_constructor_and_cache() -> 
     groups = await store.list_groups()
 
     assert groups == []
-    assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == {
-        'default_preset_id': 1,
-        'presets': [
-            {
-                'id': 1,
-                'version': 1,
-                'preset': {
-                    'name': 'Default',
-                    'slowed': {'step': 0.08, 'levels': 4},
-                    'sped_up': {'step': 0.04, 'levels': 2},
-                    'reverb_start': 0.03,
-                    'reverb_step': 0.02,
-                },
-            }
-        ],
-    }
+    assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == [
+        {
+            'id': 1,
+            'version': 1,
+            'preset': {
+                'name': 'Default',
+                'slowed': {'step': 0.08, 'levels': 4},
+                'sped_up': {'step': 0.04, 'levels': 2},
+                'reverb_start': 0.03,
+                'reverb_step': 0.02,
+            },
+        }
+    ]
     assert store._presets_cache == Presets(
-        default_preset_id=1,
         presets=[_stored_preset(preset_id=1, version=1, preset=bootstrap_preset)],
     )
 
 
 @pytest.mark.asyncio
 async def test_existing_s3_presets_win_over_bootstrap_input() -> None:
-    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes(default_preset_id=2)})
+    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
     store = _store(
         s3_client,
         bootstrap_preset=_bootstrap_preset(),
@@ -793,22 +787,21 @@ async def test_existing_s3_presets_win_over_bootstrap_input() -> None:
     await store.list_groups()
 
     assert store._presets_cache == Presets(
-        default_preset_id=2,
         presets=_sample_stored_presets(),
     )
-    assert json.loads(s3_client.objects[_presets_key()].decode('utf-8'))['presets'][0]['version'] == 3
+    assert json.loads(s3_client.objects[_presets_key()].decode('utf-8'))[0]['version'] == 3
 
 
 @pytest.mark.asyncio
 async def test_list_presets_returns_stored_presets() -> None:
-    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes(default_preset_id=2)}))
+    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
 
     assert await store.list_presets() == _sample_stored_presets()
 
 
 @pytest.mark.asyncio
 async def test_list_presets_returns_shallow_copy_of_cached_list() -> None:
-    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes(default_preset_id=2)}))
+    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
 
     listed_presets = await store.list_presets()
 
@@ -819,7 +812,7 @@ async def test_list_presets_returns_shallow_copy_of_cached_list() -> None:
 
 
 @pytest.mark.asyncio
-async def test_add_preset_appends_new_stored_preset_and_preserves_default() -> None:
+async def test_add_preset_appends_new_stored_preset_and_preserves_default_first() -> None:
     new_preset = _preset(
         name='hard',
         slowed=PresetMode(step=0.09, levels=4),
@@ -827,7 +820,7 @@ async def test_add_preset_appends_new_stored_preset_and_preserves_default() -> N
         reverb_start=0.04,
         reverb_step=0.02,
     )
-    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes(default_preset_id=2)})
+    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
     store = _store(s3_client)
 
     await store.add_preset(new_preset)
@@ -841,47 +834,43 @@ async def test_add_preset_appends_new_stored_preset_and_preserves_default() -> N
         ),
     ]
     assert store._presets_cache == Presets(
-        default_preset_id=2,
         presets=expected_presets,
     )
-    assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == {
-        'default_preset_id': 2,
-        'presets': [
-            {
-                'id': 1,
-                'version': 3,
-                'preset': {
-                    'name': 'default',
-                    'slowed': {'step': 0.06, 'levels': 3},
-                    'sped_up': {'step': 0.06, 'levels': 2},
-                    'reverb_start': 0.01,
-                    'reverb_step': 0.01,
-                },
+    assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == [
+        {
+            'id': 1,
+            'version': 3,
+            'preset': {
+                'name': 'default',
+                'slowed': {'step': 0.06, 'levels': 3},
+                'sped_up': {'step': 0.06, 'levels': 2},
+                'reverb_start': 0.01,
+                'reverb_step': 0.01,
             },
-            {
-                'id': 2,
-                'version': 1,
-                'preset': {
-                    'name': 'soft',
-                    'slowed': {'step': 0.05, 'levels': 2},
-                    'sped_up': None,
-                    'reverb_start': 0.02,
-                    'reverb_step': 0.01,
-                },
+        },
+        {
+            'id': 2,
+            'version': 1,
+            'preset': {
+                'name': 'soft',
+                'slowed': {'step': 0.05, 'levels': 2},
+                'sped_up': None,
+                'reverb_start': 0.02,
+                'reverb_step': 0.01,
             },
-            {
-                'id': 3,
-                'version': 1,
-                'preset': {
-                    'name': 'hard',
-                    'slowed': {'step': 0.09, 'levels': 4},
-                    'sped_up': {'step': 0.03, 'levels': 3},
-                    'reverb_start': 0.04,
-                    'reverb_step': 0.02,
-                },
+        },
+        {
+            'id': 3,
+            'version': 1,
+            'preset': {
+                'name': 'hard',
+                'slowed': {'step': 0.09, 'levels': 4},
+                'sped_up': {'step': 0.03, 'levels': 3},
+                'reverb_start': 0.04,
+                'reverb_step': 0.02,
             },
-        ],
-    }
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -893,13 +882,12 @@ async def test_replace_preset_preserves_id_increments_version_and_keeps_default(
         reverb_start=0.08,
         reverb_step=0.03,
     )
-    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes(default_preset_id=2)})
+    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
     store = _store(s3_client)
 
     await store.replace_preset(2, replacement)
 
     assert store._presets_cache == Presets(
-        default_preset_id=2,
         presets=[
             _sample_stored_presets()[0],
             _stored_preset(
@@ -909,106 +897,121 @@ async def test_replace_preset_preserves_id_increments_version_and_keeps_default(
             ),
         ],
     )
-    assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == {
-        'default_preset_id': 2,
-        'presets': [
-            {
-                'id': 1,
-                'version': 3,
-                'preset': {
-                    'name': 'default',
-                    'slowed': {'step': 0.06, 'levels': 3},
-                    'sped_up': {'step': 0.06, 'levels': 2},
-                    'reverb_start': 0.01,
-                    'reverb_step': 0.01,
-                },
+    assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == [
+        {
+            'id': 1,
+            'version': 3,
+            'preset': {
+                'name': 'default',
+                'slowed': {'step': 0.06, 'levels': 3},
+                'sped_up': {'step': 0.06, 'levels': 2},
+                'reverb_start': 0.01,
+                'reverb_step': 0.01,
             },
-            {
-                'id': 2,
-                'version': 2,
-                'preset': {
-                    'name': 'updated soft',
-                    'slowed': None,
-                    'sped_up': {'step': 0.07, 'levels': 5},
-                    'reverb_start': 0.08,
-                    'reverb_step': 0.03,
-                },
+        },
+        {
+            'id': 2,
+            'version': 2,
+            'preset': {
+                'name': 'updated soft',
+                'slowed': None,
+                'sped_up': {'step': 0.07, 'levels': 5},
+                'reverb_start': 0.08,
+                'reverb_step': 0.03,
             },
-        ],
-    }
+        },
+    ]
 
 
 @pytest.mark.asyncio
-async def test_set_default_preset_changes_only_default_id() -> None:
-    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes(default_preset_id=1)})
+async def test_set_default_preset_reorders_selected_preset_to_front() -> None:
+    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
     store = _store(s3_client)
 
     await store.set_default_preset(2)
 
     assert store._presets_cache == Presets(
-        default_preset_id=2,
-        presets=_sample_stored_presets(),
-    )
-    assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == {
-        'default_preset_id': 2,
-        'presets': [
-            {
-                'id': 1,
-                'version': 3,
-                'preset': {
-                    'name': 'default',
-                    'slowed': {'step': 0.06, 'levels': 3},
-                    'sped_up': {'step': 0.06, 'levels': 2},
-                    'reverb_start': 0.01,
-                    'reverb_step': 0.01,
-                },
-            },
-            {
-                'id': 2,
-                'version': 1,
-                'preset': {
-                    'name': 'soft',
-                    'slowed': {'step': 0.05, 'levels': 2},
-                    'sped_up': None,
-                    'reverb_start': 0.02,
-                    'reverb_step': 0.01,
-                },
-            },
+        presets=[
+            _sample_stored_presets()[1],
+            _sample_stored_presets()[0],
         ],
-    }
+    )
+    assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == [
+        {
+            'id': 2,
+            'version': 1,
+            'preset': {
+                'name': 'soft',
+                'slowed': {'step': 0.05, 'levels': 2},
+                'sped_up': None,
+                'reverb_start': 0.02,
+                'reverb_step': 0.01,
+            },
+        },
+        {
+            'id': 1,
+            'version': 3,
+            'preset': {
+                'name': 'default',
+                'slowed': {'step': 0.06, 'levels': 3},
+                'sped_up': {'step': 0.06, 'levels': 2},
+                'reverb_start': 0.01,
+                'reverb_step': 0.01,
+            },
+        },
+    ]
 
 
 @pytest.mark.asyncio
-async def test_remove_preset_removes_non_default_and_preserves_default() -> None:
-    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes(default_preset_id=1)})
+async def test_set_default_preset_is_noop_when_selected_preset_is_already_first() -> None:
+    original_bytes = _presets_bytes()
+    s3_client = _FakeS3Client(objects={_presets_key(): original_bytes})
+    store = _store(s3_client)
+
+    await store.set_default_preset(1)
+
+    assert store._presets_cache == Presets(
+        presets=_sample_stored_presets(),
+    )
+    assert s3_client.objects[_presets_key()] == original_bytes
+    assert s3_client.put_calls == []
+
+
+@pytest.mark.asyncio
+async def test_remove_preset_removes_non_default_preset() -> None:
+    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes()})
     store = _store(s3_client)
 
     await store.remove_preset(2)
 
     assert store._presets_cache == Presets(
-        default_preset_id=1,
         presets=[_sample_stored_presets()[0]],
     )
-    assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == {
-        'default_preset_id': 1,
-        'presets': [
-            {
-                'id': 1,
-                'version': 3,
-                'preset': {
-                    'name': 'default',
-                    'slowed': {'step': 0.06, 'levels': 3},
-                    'sped_up': {'step': 0.06, 'levels': 2},
-                    'reverb_start': 0.01,
-                    'reverb_step': 0.01,
-                },
-            }
-        ],
-    }
+    assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == [
+        {
+            'id': 1,
+            'version': 3,
+            'preset': {
+                'name': 'default',
+                'slowed': {'step': 0.06, 'levels': 3},
+                'sped_up': {'step': 0.06, 'levels': 2},
+                'reverb_start': 0.01,
+                'reverb_step': 0.01,
+            },
+        }
+    ]
 
 
 @pytest.mark.asyncio
-async def test_remove_preset_reassigns_default_to_smallest_remaining_id() -> None:
+async def test_remove_preset_rejects_removing_default_preset() -> None:
+    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
+
+    with pytest.raises(track_store_module.TrackDefaultPresetRemovalError, match='Cannot remove default preset: 1'):
+        await store.remove_preset(1)
+
+
+@pytest.mark.asyncio
+async def test_remove_preset_rejects_removing_default_preset_after_reordering() -> None:
     presets = [
         _stored_preset(
             preset_id=2,
@@ -1044,51 +1047,11 @@ async def test_remove_preset_reassigns_default_to_smallest_remaining_id() -> Non
             ),
         ),
     ]
-    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes(default_preset_id=2, presets=presets)})
+    s3_client = _FakeS3Client(objects={_presets_key(): _presets_bytes(presets=presets)})
     store = _store(s3_client)
 
-    await store.remove_preset(2)
-
-    assert store._presets_cache == Presets(
-        default_preset_id=5,
-        presets=presets[1:],
-    )
-    assert json.loads(s3_client.objects[_presets_key()].decode('utf-8')) == {
-        'default_preset_id': 5,
-        'presets': [
-            {
-                'id': 5,
-                'version': 1,
-                'preset': {
-                    'name': 'soft',
-                    'slowed': {'step': 0.05, 'levels': 2},
-                    'sped_up': None,
-                    'reverb_start': 0.02,
-                    'reverb_step': 0.01,
-                },
-            },
-            {
-                'id': 7,
-                'version': 4,
-                'preset': {
-                    'name': 'hard',
-                    'slowed': None,
-                    'sped_up': {'step': 0.03, 'levels': 3},
-                    'reverb_start': 0.03,
-                    'reverb_step': 0.02,
-                },
-            },
-        ],
-    }
-
-
-@pytest.mark.asyncio
-async def test_remove_preset_rejects_removing_last_remaining_preset() -> None:
-    single_preset = [_stored_preset(preset_id=1, version=1, preset=_bootstrap_preset())]
-    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes(default_preset_id=1, presets=single_preset)}))
-
-    with pytest.raises(ValueError, match='Cannot remove the last remaining preset'):
-        await store.remove_preset(1)
+    with pytest.raises(track_store_module.TrackDefaultPresetRemovalError, match='Cannot remove default preset: 2'):
+        await store.remove_preset(2)
 
 
 @pytest.mark.asyncio
@@ -1984,7 +1947,7 @@ async def test_fetch_with_explicit_preset_returns_current_original_and_instrumen
     applied_preset = _applied_preset(preset_id=resolved.id, version=resolved.version, preset=resolved.preset)
     store = _store(_FakeS3Client())
     objects = {
-        _presets_key(): _presets_bytes(default_preset_id=2, presets=presets),
+        _presets_key(): _presets_bytes(presets=presets),
         manifest_key: _manifest_bytes(
             [
                 ManifestEntry(
@@ -2063,7 +2026,7 @@ async def test_fetch_with_explicit_preset_returns_current_original_and_instrumen
 
 @pytest.mark.asyncio
 async def test_fetch_with_unknown_preset_id_raises_value_error() -> None:
-    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes(default_preset_id=2)}))
+    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
 
     with pytest.raises(ValueError, match='Unknown preset id: 99'):
         await store.fetch(_track_group(), _UUID_1, preset_id=99)
@@ -2078,7 +2041,7 @@ async def test_fetch_with_none_resolves_current_default_preset_and_returns_no_in
     generation_calls = _patch_create_audio_variant(monkeypatch)
 
     def _tracking_default_preset(self: Presets) -> PresetRecord:
-        default_calls.append(self.default_preset_id)
+        default_calls.append(self.presets[0].id)
         return original_default_preset(self)
 
     group = _track_group()
@@ -2088,7 +2051,12 @@ async def test_fetch_with_none_resolves_current_default_preset_and_returns_no_in
     monkeypatch.setattr(Presets, 'default_preset', _tracking_default_preset)
     s3_client = _FakeS3Client(
         objects={
-            _presets_key(): _presets_bytes(default_preset_id=2),
+            _presets_key(): _presets_bytes(
+                presets=[
+                    _sample_stored_presets()[1],
+                    _sample_stored_presets()[0],
+                ]
+            ),
             manifest_key: _manifest_bytes(
                 [
                     ManifestEntry(
@@ -2169,7 +2137,7 @@ async def test_fetch_regenerates_original_variants_when_preset_id_mismatches(mon
     previous_applied_preset = _applied_preset(preset_id=2, version=1, preset=_sample_stored_presets()[1].preset)
     s3_client = _FakeS3Client(
         objects={
-            _presets_key(): _presets_bytes(default_preset_id=1),
+            _presets_key(): _presets_bytes(),
             manifest_key: _manifest_bytes(
                 [
                     ManifestEntry(
@@ -2238,7 +2206,7 @@ async def test_fetch_regenerates_original_variants_when_preset_version_mismatche
     previous_applied_preset = _applied_preset(preset_id=1, version=2)
     s3_client = _FakeS3Client(
         objects={
-            _presets_key(): _presets_bytes(default_preset_id=1),
+            _presets_key(): _presets_bytes(),
             manifest_key: _manifest_bytes(
                 [
                     ManifestEntry(
@@ -2284,7 +2252,7 @@ async def test_fetch_treats_variant_count_mismatch_as_stale(monkeypatch: pytest.
     stale_applied_preset = AppliedPreset(id=1, version=3, variant_count=4)
     s3_client = _FakeS3Client(
         objects={
-            _presets_key(): _presets_bytes(default_preset_id=1),
+            _presets_key(): _presets_bytes(),
             manifest_key: _manifest_bytes(
                 [
                     ManifestEntry(
@@ -2345,7 +2313,7 @@ async def test_fetch_regenerates_instrumental_variants_when_manifest_flag_is_fal
     )
     s3_client = _FakeS3Client(
         objects={
-            _presets_key(): _presets_bytes(default_preset_id=1),
+            _presets_key(): _presets_bytes(),
             manifest_key: _manifest_bytes(
                 [
                     ManifestEntry(
@@ -2404,7 +2372,7 @@ async def test_fetch_regeneration_rewrites_manifest_with_applied_preset(monkeypa
     cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
     s3_client = _FakeS3Client(
         objects={
-            _presets_key(): _presets_bytes(default_preset_id=1),
+            _presets_key(): _presets_bytes(),
             manifest_key: _manifest_bytes(
                 [
                     ManifestEntry(
@@ -2435,7 +2403,7 @@ async def test_fetch_regeneration_rewrites_manifest_with_applied_preset(monkeypa
 
 @pytest.mark.asyncio
 async def test_public_methods_wrap_corrupted_presets() -> None:
-    store = _store(_FakeS3Client(objects={_presets_key(): b'{"default_preset_id": 1}'}))
+    store = _store(_FakeS3Client(objects={_presets_key(): b'[]'}))
 
     with pytest.raises(TrackPresetsCorruptedError):
         await store.list_groups()
