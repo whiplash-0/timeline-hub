@@ -954,8 +954,13 @@ class TrackStore:
         track_groups = [self._parse_track_group_prefix(prefix) for prefix in track_group_prefixes]
         return sorted(track_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
 
-    async def list_sub_seasons(self, group: TrackGroup) -> list[SubSeason]:
-        """List unique sub-seasons present in a group's authoritative manifest.
+    async def list_tracks(self, group: TrackGroup) -> dict[SubSeason, list[TrackInfo]]:
+        """List discovery metadata for all tracks in a group, grouped by sub-season.
+
+        Returned items are discovery metadata only. Sub-seasons are ordered by
+        `SubSeason.order()`. Tracks within each sub-season are ordered by the
+        authoritative manifest's ascending internal `order`, but that internal
+        `order` is intentionally not exposed in the public return type.
 
         Raises:
             TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
@@ -964,37 +969,21 @@ class TrackStore:
         """
         await self._preset_store.ensure_ready()
         manifest = await self._require_group_manifest(group, sub_season=None)
-        sub_seasons = {entry.sub_season for entry in manifest}
-        return sorted(sub_seasons, key=lambda value: value.order())
-
-    async def list_tracks(self, group: TrackGroup, sub_season: SubSeason) -> list[TrackInfo]:
-        """List discovery metadata for tracks in one sub-season of a group.
-
-        Returned items are discovery metadata only. Results are ordered by the
-        authoritative manifest's ascending internal `order` within the
-        requested `sub_season`, but that internal `order` is intentionally not
-        exposed in the public return type.
-
-        Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
-            TrackGroupNotFoundError: If the requested group manifest does not exist.
-            TrackManifestCorruptedError: If the group manifest exists but is malformed.
-        """
-        await self._preset_store.ensure_ready()
-        manifest = await self._require_group_manifest(group, sub_season=sub_season)
-        entries = sorted(
-            (entry for entry in manifest if entry.sub_season is sub_season),
-            key=lambda entry: entry.order,
-        )
-        return [
-            TrackInfo(
-                id=entry.id,
-                artists=entry.artists,
-                title=entry.title,
-                has_instrumental=entry.has_instrumental,
-            )
-            for entry in entries
-        ]
+        grouped_entries: dict[SubSeason, list[ManifestEntry]] = {}
+        for entry in manifest:
+            grouped_entries.setdefault(entry.sub_season, []).append(entry)
+        return {
+            sub_season: [
+                TrackInfo(
+                    id=entry.id,
+                    artists=entry.artists,
+                    title=entry.title,
+                    has_instrumental=entry.has_instrumental,
+                )
+                for entry in sorted(grouped_entries[sub_season], key=lambda entry: entry.order)
+            ]
+            for sub_season in sorted(grouped_entries, key=lambda value: value.order())
+        }
 
     async def store(
         self,

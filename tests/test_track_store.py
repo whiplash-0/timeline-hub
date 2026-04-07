@@ -1216,7 +1216,7 @@ async def test_list_groups_fails_on_malformed_prefix() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_sub_seasons_returns_unique_sorted_values_with_none_first() -> None:
+async def test_list_tracks_groups_by_sub_season_with_none_first() -> None:
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2024, season=Season.S1)
     store = _store(
         _FakeS3Client(
@@ -1260,18 +1260,38 @@ async def test_list_sub_seasons_returns_unique_sorted_values_with_none_first() -
         )
     )
 
-    assert await store.list_sub_seasons(TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1)) == [
-        SubSeason.NONE,
-        SubSeason.B,
-    ]
+    assert await store.list_tracks(TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1)) == {
+        SubSeason.NONE: [
+            TrackInfo(
+                id=_UUID_2,
+                artists=('artist',),
+                title='title',
+                has_instrumental=True,
+            )
+        ],
+        SubSeason.B: [
+            TrackInfo(
+                id=_UUID_1,
+                artists=('artist',),
+                title='title',
+                has_instrumental=False,
+            ),
+            TrackInfo(
+                id=_UUID_3,
+                artists=('artist',),
+                title='title',
+                has_instrumental=False,
+            ),
+        ],
+    }
 
 
 @pytest.mark.asyncio
-async def test_list_sub_seasons_fails_on_missing_manifest() -> None:
+async def test_list_tracks_raises_group_not_found_for_missing_group() -> None:
     store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
 
     with pytest.raises(TrackGroupNotFoundError) as excinfo:
-        await store.list_sub_seasons(TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1))
+        await store.list_tracks(TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1))
 
     assert excinfo.value.universe is TrackUniverse.WEST
     assert excinfo.value.year == 2024
@@ -1280,7 +1300,7 @@ async def test_list_sub_seasons_fails_on_missing_manifest() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_sub_seasons_wraps_corrupted_manifest() -> None:
+async def test_list_tracks_wraps_corrupted_manifest() -> None:
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2024, season=Season.S1)
     store = _store(
         _FakeS3Client(
@@ -1292,11 +1312,11 @@ async def test_list_sub_seasons_wraps_corrupted_manifest() -> None:
     )
 
     with pytest.raises(TrackManifestCorruptedError):
-        await store.list_sub_seasons(TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1))
+        await store.list_tracks(TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1))
 
 
 @pytest.mark.asyncio
-async def test_list_tracks_filters_requested_sub_season_and_sorts_by_manifest_order() -> None:
+async def test_list_tracks_groups_by_sub_season_and_sorts_by_manifest_order() -> None:
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2024, season=Season.S1)
     store = _store(
         _FakeS3Client(
@@ -1340,23 +1360,30 @@ async def test_list_tracks_filters_requested_sub_season_and_sorts_by_manifest_or
         )
     )
 
-    assert await store.list_tracks(
-        TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1),
-        SubSeason.A,
-    ) == [
-        TrackInfo(
-            id=_UUID_3,
-            artists=('artist a', 'artist b'),
-            title='second in manifest, first in order',
-            has_instrumental=True,
-        ),
-        TrackInfo(
-            id=_UUID_1,
-            artists=('artist c',),
-            title='third in manifest, second in order',
-            has_instrumental=False,
-        ),
-    ]
+    assert await store.list_tracks(TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1)) == {
+        SubSeason.A: [
+            TrackInfo(
+                id=_UUID_3,
+                artists=('artist a', 'artist b'),
+                title='second in manifest, first in order',
+                has_instrumental=True,
+            ),
+            TrackInfo(
+                id=_UUID_1,
+                artists=('artist c',),
+                title='third in manifest, second in order',
+                has_instrumental=False,
+            ),
+        ],
+        SubSeason.B: [
+            TrackInfo(
+                id=_UUID_2,
+                artists=('artist other',),
+                title='other sub-season',
+                has_instrumental=True,
+            )
+        ],
+    }
 
 
 @pytest.mark.asyncio
@@ -1384,17 +1411,16 @@ async def test_list_tracks_returns_track_info_with_only_public_discovery_fields(
         )
     )
 
-    result = await store.list_tracks(
-        TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1),
-        SubSeason.NONE,
-    )
+    result = await store.list_tracks(TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1))
 
-    assert result == [TrackInfo(id=_UUID_1, artists=('artist',), title='title', has_instrumental=True)]
-    assert tuple(result[0].__slots__) == ('id', 'artists', 'title', 'has_instrumental')
+    assert result == {
+        SubSeason.NONE: [TrackInfo(id=_UUID_1, artists=('artist',), title='title', has_instrumental=True)]
+    }
+    assert tuple(result[SubSeason.NONE][0].__slots__) == ('id', 'artists', 'title', 'has_instrumental')
 
 
 @pytest.mark.asyncio
-async def test_list_tracks_returns_empty_list_for_existing_group_with_missing_sub_season() -> None:
+async def test_list_tracks_omits_missing_sub_season_for_existing_group() -> None:
     manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2024, season=Season.S1)
     store = _store(
         _FakeS3Client(
@@ -1418,29 +1444,16 @@ async def test_list_tracks_returns_empty_list_for_existing_group_with_missing_su
         )
     )
 
-    assert (
-        await store.list_tracks(
-            TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1),
-            SubSeason.C,
-        )
-        == []
-    )
-
-
-@pytest.mark.asyncio
-async def test_list_tracks_raises_group_not_found_for_missing_group() -> None:
-    store = _store(_FakeS3Client(objects={_presets_key(): _presets_bytes()}))
-
-    with pytest.raises(TrackGroupNotFoundError) as excinfo:
-        await store.list_tracks(
-            TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1),
-            SubSeason.D,
-        )
-
-    assert excinfo.value.universe is TrackUniverse.WEST
-    assert excinfo.value.year == 2024
-    assert excinfo.value.season is Season.S1
-    assert excinfo.value.sub_season is SubSeason.D
+    assert await store.list_tracks(TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1)) == {
+        SubSeason.A: [
+            TrackInfo(
+                id=_UUID_1,
+                artists=('artist',),
+                title='title',
+                has_instrumental=False,
+            )
+        ]
+    }
 
 
 @pytest.mark.asyncio
