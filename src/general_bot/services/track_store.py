@@ -305,7 +305,7 @@ class Presets:
         """Return the stored preset with the given id or raise `ValueError`."""
         preset = self.get(preset_id)
         if preset is None:
-            raise ValueError(f'Unknown preset id: {preset_id}')
+            raise PresetNotFoundError(f'Unknown preset id: {preset_id}')
         return preset
 
     def default_preset(self) -> PresetRecord:
@@ -577,6 +577,10 @@ class TrackPresetsCorruptedError(RuntimeError):
         super().__init__(f'Track presets at {key} are corrupted: {reason}')
 
 
+class PresetNotFoundError(ValueError):
+    """Raised when a strict preset lookup refers to an unknown preset id."""
+
+
 class TrackDefaultPresetRemovalError(ValueError):
     """Raised when attempting to remove the current default preset."""
 
@@ -685,9 +689,9 @@ class PresetStore:
 
     `PresetStore` fully owns bootstrap initialization, lazy cache state, JSON
     decoding, schema validation, corruption handling, persistence, and preset
-    resolution rules. It is the only component that touches
-    `tracks/presets.json`, and higher-level services do not work with raw
-    `Presets` directly.
+    cache-backed preset-management operations. It is the only component that
+    touches `tracks/presets.json`, and higher-level services do not work with
+    raw `Presets` directly.
 
     Preset invariants:
         - The registry is never empty.
@@ -701,12 +705,8 @@ class PresetStore:
         self._bootstrap_preset = bootstrap_preset
         self._presets_cache: Presets | None = None
 
-    async def ensure_ready(self) -> None:
-        """Force bootstrap and validation of preset storage."""
-        await self._load_presets()
-
     async def all(self) -> list[PresetRecord]:
-        """List authoritative stored preset records, including version metadata."""
+        """List presets in storage order. Index 0 is always the default preset."""
         presets = await self._load_presets()
         return list(presets.presets)
 
@@ -719,38 +719,6 @@ class PresetStore:
         """Return one stored preset by id or raise `ValueError`."""
         presets = await self._load_presets()
         return presets.require(preset_id)
-
-    async def resolve(self, preset_id: PresetId | None) -> PresetRecord:
-        """Resolve store-time preset selection.
-
-        `None` selects the current default preset. An explicit id is required
-        strictly and raises `ValueError` if unknown.
-        """
-        if preset_id is None:
-            return await self.default()
-        return await self.require(preset_id)
-
-    async def resolve_with_fallback(
-        self,
-        *,
-        requested_id: PresetId | None,
-        fallback_id: PresetId,
-    ) -> PresetRecord:
-        """Resolve preset using fallback semantics.
-
-        Resolution order:
-        - if `requested_id` is provided, it must exist (strict)
-        - otherwise `fallback_id` is attempted
-        - if `fallback_id` is missing, the current default is returned
-        """
-        if requested_id is not None:
-            return await self.require(requested_id)
-
-        presets = await self._load_presets()
-        snapshot = presets.get(fallback_id)
-        if snapshot is not None:
-            return snapshot
-        return presets.default_preset()
 
     async def add(self, preset: Preset) -> None:
         """Append a new stored preset record.
@@ -907,9 +875,9 @@ class TrackStore:
     regenerated later from those authoritative inputs.
 
     Preset registry state is owned by an external `PresetStore`. `TrackStore`
-    depends on that service for readiness checks and resolved preset
-    selection only and does not bootstrap, parse, validate, persist, or cache
-    `tracks/presets.json` itself.
+    depends on that service for preset data access only and owns its own
+    store/fetch preset-selection policy. It does not bootstrap, parse,
+    validate, persist, or cache `tracks/presets.json` itself.
 
     The group manifest is authoritative for logical tracks in a `TrackGroup`.
     Store-path reads use copy-safe manifests so writes can stage updates before
@@ -930,7 +898,7 @@ class TrackStore:
     """
 
     def __init__(self, s3_client: S3Client, *, preset_store: PresetStore) -> None:
-        """Initialize the store with an opened generic S3 client and preset resolver.
+        """Initialize the store with an opened generic S3 client and preset store.
 
         The caller constructs and owns the `PresetStore` instance passed here.
         """
@@ -949,7 +917,6 @@ class TrackStore:
         `tracks/presets.json` is not part of the returned collection and no
         file-specific ignore list is needed here.
         """
-        await self._preset_store.ensure_ready()
         track_group_prefixes = await self._s3_client.list_subprefixes(prefix=_TRACKS_PREFIX)
         track_groups = [self._parse_track_group_prefix(prefix) for prefix in track_group_prefixes]
         return sorted(track_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
@@ -967,7 +934,6 @@ class TrackStore:
             TrackGroupNotFoundError: If the requested group manifest does not exist.
             TrackManifestCorruptedError: If the group manifest exists but is malformed.
         """
-        await self._preset_store.ensure_ready()
         manifest = await self._require_group_manifest(group, sub_season=None)
         grouped_entries: dict[SubSeason, list[ManifestEntry]] = {}
         for entry in manifest:
@@ -1040,7 +1006,10 @@ class TrackStore:
         if sample_rate != 48_000:
             raise TrackInvalidAudioFormatError(f'Audio sample rate must be 48000 Hz, got {sample_rate}')
 
-        resolved_preset = await self._preset_store.resolve(preset_id)
+        if preset_id is None:
+            resolved_preset = await self._preset_store.default()
+        else:
+            resolved_preset = await self._preset_store.require(preset_id)
         variant_count = len(self._resolve_variant_specs(resolved_preset.preset))
 
         track_group_prefix = self._track_group_prefix(
@@ -1143,7 +1112,6 @@ class TrackStore:
             TrackInvalidAudioFormatError: If provided audio bytes are not 48_000 Hz audio.
             TrackUpdateManifestSyncError: If one or more object mutations are applied but a later stage fails.
         """
-        await self._preset_store.ensure_ready()
         if (
             artists is None
             and title is None
@@ -1382,10 +1350,13 @@ class TrackStore:
         manifest = await self._require_group_manifest(group, sub_season=None)
         entry = self._require_manifest_entry(manifest, group=group, track_id=track_id)
 
-        resolved_stored_preset = await self._preset_store.resolve_with_fallback(
-            requested_id=preset_id,
-            fallback_id=entry.preset.id,
-        )
+        if preset_id is not None:
+            resolved_stored_preset = await self._preset_store.require(preset_id)
+        else:
+            try:
+                resolved_stored_preset = await self._preset_store.require(entry.preset.id)
+            except ValueError:
+                resolved_stored_preset = await self._preset_store.default()
 
         cover_key = self._cover_key(track_group_prefix, track_id)
         cover_bytes = await self._s3_client.get_bytes(cover_key)
