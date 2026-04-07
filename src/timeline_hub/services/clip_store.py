@@ -894,15 +894,15 @@ class ClipStore:
             raw_clip_key = self._clip_key(clip_group_prefix, removed_id)
             try:
                 await self._s3_client.delete_key(raw_clip_key)
-            except Exception:
-                logger.exception('Failed to delete key {}', raw_clip_key)
+            except Exception as exc:
+                logger.error('Failed to delete key {}: {}', raw_clip_key, exc)
                 failed_keys.append(raw_clip_key)
             if removed_entry.audio_normalization is not None:
                 normalized_clip_key = self._normalized_clip_key(clip_group_prefix, removed_id)
                 try:
                     await self._s3_client.delete_key(normalized_clip_key)
-                except Exception:
-                    logger.exception('Failed to delete key {}', normalized_clip_key)
+                except Exception as exc:
+                    logger.error('Failed to delete key {}: {}', normalized_clip_key, exc)
                     failed_keys.append(normalized_clip_key)
 
         if failed_keys:
