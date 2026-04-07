@@ -20,6 +20,7 @@ from general_bot.services.track_store import (
     Season,
     SubSeason,
     Track,
+    TrackFetchManifestSyncError,
     TrackGroup,
     TrackGroupNotFoundError,
     TrackInfo,
@@ -2182,6 +2183,78 @@ async def test_update_audio_wraps_partial_variant_deletion_as_sync_error(
 
 
 @pytest.mark.asyncio
+async def test_update_later_stage_sync_error_unions_prior_and_assumed_touched_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
+    probe_calls = _patch_probe_audio_sample_rate(monkeypatch)
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    instrumental_key = _instrumental_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=_UUID_1,
+    )
+    store = _store(_FakeS3Client())
+    instrumental_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[0].preset,
+            payload_prefix='old-inst',
+            instrumental=True,
+        ).keys()
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        preset=_applied_preset(),
+                        has_variants=False,
+                        has_instrumental=True,
+                        has_instrumental_variants=True,
+                    )
+                ]
+            ),
+            track_key: b'old-track',
+            instrumental_key: b'old-instrumental',
+        },
+        delete_failures={instrumental_variant_keys[1]},
+    )
+    s3_client.objects.update(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[0].preset,
+            payload_prefix='old-inst',
+            instrumental=True,
+        )
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(TrackUpdateManifestSyncError, match='instrumental_variant_delete') as excinfo:
+        await store.update(group, _UUID_1, audio_bytes=b'new-track', instrumental_bytes=b'new-instrumental')
+
+    assert probe_calls == [b'new-track', b'new-instrumental']
+    assert excinfo.value.stage == 'instrumental_variant_delete'
+    assert excinfo.value.track_id == _UUID_1
+    assert excinfo.value.touched_keys == (track_key, *instrumental_variant_keys)
+    assert excinfo.value.manifest_key == manifest_key
+    assert getattr(excinfo.value, '__notes__', []) == [
+        f"Instrumental variant delete error: RuntimeError('boom deleting {instrumental_variant_keys[1]}')"
+    ]
+    assert s3_client.objects[track_key] == b'new-track'
+    assert instrumental_variant_keys[0] not in s3_client.objects
+    assert instrumental_variant_keys[1] in s3_client.objects
+
+
+@pytest.mark.asyncio
 async def test_update_instrumental_first_attach_sets_manifest_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     group = TrackGroup(universe=TrackUniverse.WEST, year=2026, season=Season.S1)
     probe_calls = _patch_probe_audio_sample_rate(monkeypatch)
@@ -2989,6 +3062,518 @@ async def test_fetch_regeneration_rewrites_manifest_with_applied_preset(monkeypa
         iter(store._manifest_cache[_track_group_prefix(universe=group.universe, year=group.year, season=group.season)])
     ).preset
     assert cached_applied_preset == _applied_preset(preset_id=1, version=3, preset=_sample_stored_presets()[0].preset)
+
+
+@pytest.mark.asyncio
+async def test_fetch_wraps_partial_original_variant_upload_as_sync_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_create_audio_variant(monkeypatch)
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    store = _store(_FakeS3Client())
+    original_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[0].preset,
+            payload_prefix='unused',
+        ).keys()
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([_entry(id=_UUID_1, has_variants=False)]),
+            track_key: b'authoritative-track',
+            cover_key: b'cover',
+        },
+        put_failures={original_variant_keys[1]},
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(TrackFetchManifestSyncError, match='original_variant_upload') as excinfo:
+        await store.fetch(group, _UUID_1, preset_id=1)
+
+    assert excinfo.value.stage == 'original_variant_upload'
+    assert excinfo.value.track_id == _UUID_1
+    assert excinfo.value.touched_keys == (original_variant_keys[0],)
+    assert excinfo.value.manifest_key == manifest_key
+    assert getattr(excinfo.value, '__notes__', []) == [
+        f"Original variant upload error: RuntimeError('boom putting {original_variant_keys[1]}')"
+    ]
+    assert s3_client.objects[original_variant_keys[0]] == b'authoritative-track|0.82|0.03'
+    assert original_variant_keys[1] not in s3_client.objects
+    assert s3_client.objects[manifest_key] == _manifest_bytes([_entry(id=_UUID_1, has_variants=False)])
+
+
+@pytest.mark.asyncio
+async def test_fetch_wraps_partial_instrumental_variant_upload_as_sync_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_create_audio_variant(monkeypatch)
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    instrumental_key = _instrumental_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=_UUID_1,
+    )
+    store = _store(_FakeS3Client())
+    instrumental_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[0].preset,
+            payload_prefix='unused',
+            instrumental=True,
+        ).keys()
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [_entry(id=_UUID_1, has_variants=True, has_instrumental=True, has_instrumental_variants=False)]
+            ),
+            cover_key: b'cover',
+            instrumental_key: b'authoritative-instrumental',
+        },
+        put_failures={instrumental_variant_keys[1]},
+    )
+    s3_client.objects.update(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[0].preset,
+            payload_prefix='orig',
+        )
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(TrackFetchManifestSyncError, match='instrumental_variant_upload') as excinfo:
+        await store.fetch(group, _UUID_1, preset_id=1)
+
+    assert excinfo.value.stage == 'instrumental_variant_upload'
+    assert excinfo.value.track_id == _UUID_1
+    assert excinfo.value.touched_keys == (instrumental_variant_keys[0],)
+    assert excinfo.value.manifest_key == manifest_key
+    assert getattr(excinfo.value, '__notes__', []) == [
+        f"Instrumental variant upload error: RuntimeError('boom putting {instrumental_variant_keys[1]}')"
+    ]
+    assert s3_client.objects[instrumental_variant_keys[0]] == b'authoritative-instrumental|0.82|0.03'
+    assert instrumental_variant_keys[1] not in s3_client.objects
+
+
+@pytest.mark.asyncio
+async def test_fetch_wraps_manifest_write_failure_after_regeneration_as_sync_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_create_audio_variant(monkeypatch)
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    instrumental_key = _instrumental_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=_UUID_1,
+    )
+    previous_applied_preset = _applied_preset(preset_id=2, version=1, preset=_sample_stored_presets()[1].preset)
+    store = _store(_FakeS3Client())
+    original_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[1].preset,
+            payload_prefix='old-orig',
+        ).keys()
+    )
+    instrumental_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[1].preset,
+            payload_prefix='old-inst',
+            instrumental=True,
+        ).keys()
+    )
+    regenerated_original_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[0].preset,
+            payload_prefix='new-orig',
+        ).keys()
+    )
+    regenerated_instrumental_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[0].preset,
+            payload_prefix='new-inst',
+            instrumental=True,
+        ).keys()
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        preset=previous_applied_preset,
+                        has_variants=True,
+                        has_instrumental=True,
+                        has_instrumental_variants=True,
+                    )
+                ]
+            ),
+            track_key: b'authoritative-track',
+            cover_key: b'cover',
+            instrumental_key: b'authoritative-instrumental',
+        },
+        put_failures={manifest_key},
+    )
+    s3_client.objects.update(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[1].preset,
+            payload_prefix='old-orig',
+        )
+    )
+    s3_client.objects.update(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[1].preset,
+            payload_prefix='old-inst',
+            instrumental=True,
+        )
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(TrackFetchManifestSyncError, match='manifest_write') as excinfo:
+        await store.fetch(group, _UUID_1, preset_id=1)
+
+    assert excinfo.value.stage == 'manifest_write'
+    assert excinfo.value.track_id == _UUID_1
+    assert excinfo.value.touched_keys == (
+        *regenerated_original_variant_keys,
+        *regenerated_instrumental_variant_keys,
+    )
+    assert excinfo.value.manifest_key == manifest_key
+    assert getattr(excinfo.value, '__notes__', []) == [
+        f"Fetch manifest write error: RuntimeError('boom putting {manifest_key}')"
+    ]
+    assert s3_client.objects[manifest_key] == _manifest_bytes(
+        [
+            _entry(
+                id=_UUID_1,
+                preset=previous_applied_preset,
+                has_variants=True,
+                has_instrumental=True,
+                has_instrumental_variants=True,
+            )
+        ]
+    )
+    assert s3_client.objects[original_variant_keys[0]] == b'authoritative-track|0.82|0.03'
+    assert s3_client.objects[instrumental_variant_keys[0]] == b'authoritative-instrumental|0.82|0.03'
+
+
+@pytest.mark.asyncio
+async def test_fetch_wraps_stale_original_variant_deletion_as_sync_error() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    previous_applied_preset = _applied_preset(preset_id=2, version=1, preset=_sample_stored_presets()[1].preset)
+    store = _store(_FakeS3Client())
+    original_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[1].preset,
+            payload_prefix='old-orig',
+        ).keys()
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([_entry(id=_UUID_1, preset=previous_applied_preset, has_variants=True)]),
+            track_key: b'authoritative-track',
+            cover_key: b'cover',
+            original_variant_keys[0]: b'old-1',
+            original_variant_keys[1]: b'old-2',
+        },
+        delete_failures={original_variant_keys[1]},
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(TrackFetchManifestSyncError, match='original_variant_delete') as excinfo:
+        await store.fetch(group, _UUID_1, preset_id=1)
+
+    assert excinfo.value.stage == 'original_variant_delete'
+    assert excinfo.value.track_id == _UUID_1
+    assert excinfo.value.touched_keys == original_variant_keys
+    assert excinfo.value.manifest_key == manifest_key
+    assert getattr(excinfo.value, '__notes__', []) == [
+        f"Original variant delete error: RuntimeError('boom deleting {original_variant_keys[1]}')"
+    ]
+    assert original_variant_keys[0] not in s3_client.objects
+    assert original_variant_keys[1] in s3_client.objects
+    assert s3_client.objects[manifest_key] == _manifest_bytes(
+        [_entry(id=_UUID_1, preset=previous_applied_preset, has_variants=True)]
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_wraps_stale_instrumental_variant_deletion_as_sync_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_create_audio_variant(monkeypatch)
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    instrumental_key = _instrumental_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=_UUID_1,
+    )
+    previous_applied_preset = _applied_preset(preset_id=2, version=1, preset=_sample_stored_presets()[1].preset)
+    store = _store(_FakeS3Client())
+    original_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[1].preset,
+            payload_prefix='old-orig',
+        ).keys()
+    )
+    instrumental_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[1].preset,
+            payload_prefix='old-inst',
+            instrumental=True,
+        ).keys()
+    )
+    regenerated_original_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[0].preset,
+            payload_prefix='new-orig',
+        ).keys()
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        preset=previous_applied_preset,
+                        has_variants=True,
+                        has_instrumental=True,
+                        has_instrumental_variants=True,
+                    )
+                ]
+            ),
+            track_key: b'authoritative-track',
+            cover_key: b'cover',
+            instrumental_key: b'authoritative-instrumental',
+        },
+        delete_failures={instrumental_variant_keys[1]},
+    )
+    s3_client.objects.update(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[1].preset,
+            payload_prefix='old-orig',
+        )
+    )
+    s3_client.objects.update(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[1].preset,
+            payload_prefix='old-inst',
+            instrumental=True,
+        )
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(TrackFetchManifestSyncError, match='instrumental_variant_delete') as excinfo:
+        await store.fetch(group, _UUID_1, preset_id=1)
+
+    assert excinfo.value.stage == 'instrumental_variant_delete'
+    assert excinfo.value.track_id == _UUID_1
+    assert excinfo.value.touched_keys == (*regenerated_original_variant_keys, *instrumental_variant_keys)
+    assert excinfo.value.manifest_key == manifest_key
+    assert getattr(excinfo.value, '__notes__', []) == [
+        f"Instrumental variant delete error: RuntimeError('boom deleting {instrumental_variant_keys[1]}')"
+    ]
+    assert s3_client.objects[original_variant_keys[0]] == b'authoritative-track|0.82|0.03'
+    assert instrumental_variant_keys[0] not in s3_client.objects
+    assert instrumental_variant_keys[1] in s3_client.objects
+
+
+@pytest.mark.asyncio
+async def test_fetch_wraps_original_source_read_failure_after_stale_variant_deletion_as_sync_error() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    previous_applied_preset = _applied_preset(preset_id=2, version=1, preset=_sample_stored_presets()[1].preset)
+    store = _store(_FakeS3Client())
+    original_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[1].preset,
+            payload_prefix='old-orig',
+        ).keys()
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([_entry(id=_UUID_1, preset=previous_applied_preset, has_variants=True)]),
+            cover_key: b'cover',
+            original_variant_keys[0]: b'old-1',
+            original_variant_keys[1]: b'old-2',
+        }
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(TrackFetchManifestSyncError, match='original_source_read') as excinfo:
+        await store.fetch(group, _UUID_1, preset_id=1)
+
+    assert excinfo.value.stage == 'original_source_read'
+    assert excinfo.value.track_id == _UUID_1
+    assert excinfo.value.touched_keys == original_variant_keys
+    assert excinfo.value.manifest_key == manifest_key
+    assert getattr(excinfo.value, '__notes__', []) == [
+        f"Original source read error: S3ObjectNotFoundError('Object not found: {track_key}')"
+    ]
+    assert original_variant_keys[0] not in s3_client.objects
+    assert original_variant_keys[1] not in s3_client.objects
+
+
+@pytest.mark.asyncio
+async def test_fetch_wraps_instrumental_source_read_failure_after_prior_mutations_as_sync_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_create_audio_variant(monkeypatch)
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    instrumental_key = _instrumental_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=_UUID_1,
+    )
+    previous_applied_preset = _applied_preset(preset_id=2, version=1, preset=_sample_stored_presets()[1].preset)
+    store = _store(_FakeS3Client())
+    instrumental_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[1].preset,
+            payload_prefix='old-inst',
+            instrumental=True,
+        ).keys()
+    )
+    regenerated_original_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[0].preset,
+            payload_prefix='new-orig',
+        ).keys()
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        preset=previous_applied_preset,
+                        has_variants=False,
+                        has_instrumental=True,
+                        has_instrumental_variants=True,
+                    )
+                ]
+            ),
+            track_key: b'authoritative-track',
+            cover_key: b'cover',
+            instrumental_variant_keys[0]: b'old-inst-1',
+            instrumental_variant_keys[1]: b'old-inst-2',
+        }
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(TrackFetchManifestSyncError, match='instrumental_source_read') as excinfo:
+        await store.fetch(group, _UUID_1, preset_id=1)
+
+    assert excinfo.value.stage == 'instrumental_source_read'
+    assert excinfo.value.track_id == _UUID_1
+    assert excinfo.value.touched_keys == (*regenerated_original_variant_keys, *instrumental_variant_keys)
+    assert excinfo.value.manifest_key == manifest_key
+    assert getattr(excinfo.value, '__notes__', []) == [
+        f"Instrumental source read error: S3ObjectNotFoundError('Object not found: {instrumental_key}')"
+    ]
+    assert s3_client.objects[regenerated_original_variant_keys[0]] == b'authoritative-track|0.82|0.03'
+    assert instrumental_variant_keys[0] not in s3_client.objects
+    assert instrumental_variant_keys[1] not in s3_client.objects
+
+
+@pytest.mark.asyncio
+async def test_fetch_original_source_read_failure_before_any_touches_escapes_raw() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([_entry(id=_UUID_1, has_variants=False)]),
+            cover_key: b'cover',
+        }
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(S3ObjectNotFoundError, match=track_key):
+        await store.fetch(group, _UUID_1, preset_id=1)
 
 
 @pytest.mark.asyncio
