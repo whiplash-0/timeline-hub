@@ -7,9 +7,9 @@ import pytest
 from aiogram.types import InlineKeyboardButton
 from aiogram.utils.formatting import Bold, Text
 
-import general_bot.handlers.clips.intake as intake_module
-import general_bot.handlers.clips.retrieve as retrieve_module
-from general_bot.handlers.clips.common import (
+import timeline_hub.handlers.clips.intake as intake_module
+import timeline_hub.handlers.clips.retrieve as retrieve_module
+from timeline_hub.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
     DUMMY_BUTTON_TEXT,
     FLOW_PULL,
@@ -24,7 +24,7 @@ from general_bot.handlers.clips.common import (
     selected_text,
     selection_labels,
 )
-from general_bot.handlers.clips.intake import (
+from timeline_hub.handlers.clips.intake import (
     IntakeAction,
     IntakeCallbackData,
     ReorderCallbackData,
@@ -42,7 +42,7 @@ from general_bot.handlers.clips.intake import (
     on_reorder_menu,
     parse_route_text,
 )
-from general_bot.handlers.clips.retrieve import (
+from timeline_hub.handlers.clips.retrieve import (
     RetrieveCallbackData,
     RetrieveEntryAction,
     RetrieveEntryCallbackData,
@@ -56,8 +56,8 @@ from general_bot.handlers.clips.retrieve import (
     on_retrieve_entry,
     on_retrieve_menu,
 )
-from general_bot.handlers.router import on_dummy_button
-from general_bot.services.clip_store import (
+from timeline_hub.handlers.router import on_dummy_button
+from timeline_hub.services.clip_store import (
     AudioNormalization,
     Clip,
     ClipGroup,
@@ -73,8 +73,8 @@ from general_bot.services.clip_store import (
     Universe,
     UnknownClipsError,
 )
-from general_bot.services.container import Services
-from general_bot.services.message_buffer import ChatMessageBuffer
+from timeline_hub.services.container import Services
+from timeline_hub.services.message_buffer import ChatMessageBuffer
 
 
 class _FakeState:
@@ -441,8 +441,8 @@ def test_route_progress_kwargs_preserves_arrow_path_rendering_without_route_labe
 
 
 def test_handlers_package_router_imports_cleanly() -> None:
-    from general_bot.app import run
-    from general_bot.handlers.router import router
+    from timeline_hub.app import run
+    from timeline_hub.handlers.router import router
 
     assert callable(run)
     assert router is not None

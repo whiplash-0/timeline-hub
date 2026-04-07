@@ -4,9 +4,9 @@ import uuid
 
 import pytest
 
-import general_bot.services.clip_store as clip_store_module
-from general_bot.infra.s3 import S3Client, S3ObjectNotFoundError
-from general_bot.services.clip_store import (
+import timeline_hub.services.clip_store as clip_store_module
+from timeline_hub.infra.s3 import S3Client, S3ObjectNotFoundError
+from timeline_hub.services.clip_store import (
     AudioNormalization,
     Clip,
     ClipGroup,

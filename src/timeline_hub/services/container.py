@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 
-from general_bot.infra.tasks import TaskScheduler
-from general_bot.services.clip_store import ClipStore
-from general_bot.services.message_buffer import ChatMessageBuffer
+from timeline_hub.infra.tasks import TaskScheduler
+from timeline_hub.services.clip_store import ClipStore
+from timeline_hub.services.message_buffer import ChatMessageBuffer
 
 
 @dataclass(frozen=True, slots=True)

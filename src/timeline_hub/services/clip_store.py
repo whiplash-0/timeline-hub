@@ -9,8 +9,8 @@ from typing import Any, Self, TypeVar
 
 from loguru import logger
 
-from general_bot.infra.ffmpeg import hash_video_content, normalize_video_audio_loudness
-from general_bot.infra.s3 import Key, Prefix, S3Client, S3ContentType, S3ObjectNotFoundError
+from timeline_hub.infra.ffmpeg import hash_video_content, normalize_video_audio_loudness
+from timeline_hub.infra.s3 import Key, Prefix, S3Client, S3ContentType, S3ObjectNotFoundError
 
 _CLIPS_PREFIX = 'clips'
 _MANIFEST_FILENAME = 'manifest.json'

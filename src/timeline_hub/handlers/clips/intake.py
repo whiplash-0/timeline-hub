@@ -14,7 +14,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiogram.utils.formatting import Bold, Text
 from loguru import logger
 
-from general_bot.handlers.clips.common import (
+from timeline_hub.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
     FLOW_RECONCILE,
     FLOW_STORE,
@@ -42,7 +42,7 @@ from general_bot.handlers.clips.common import (
     three_row_keyboard,
     validate_flow_state,
 )
-from general_bot.handlers.clips.flow import (
+from timeline_hub.handlers.clips.flow import (
     FlowMenuDefinition,
     flow_selection_labels,
     scope_option_callback_value,
@@ -56,11 +56,11 @@ from general_bot.handlers.clips.flow import (
     validate_menu_flow_state,
     year_option_universe,
 )
-from general_bot.handlers.clips.retrieve import (
+from timeline_hub.handlers.clips.retrieve import (
     _send_fetched_clip_batches,
     should_normalize_audio,
 )
-from general_bot.services.clip_store import (
+from timeline_hub.services.clip_store import (
     AudioNormalization,
     Clip,
     ClipGroup,
@@ -76,10 +76,10 @@ from general_bot.services.clip_store import (
     Universe,
     UnknownClipsError,
 )
-from general_bot.services.container import Services
-from general_bot.services.message_buffer import MessageGroup
-from general_bot.settings import Settings
-from general_bot.types import ChatId
+from timeline_hub.services.container import Services
+from timeline_hub.services.message_buffer import MessageGroup
+from timeline_hub.settings import Settings
+from timeline_hub.types import ChatId
 
 router = Router()
 _TELEGRAM_MEDIA_GROUP_LIMIT = 10

@@ -7,8 +7,8 @@ from dataclasses import replace as dataclass_replace
 from enum import IntEnum, StrEnum
 from typing import Self, TypeVar
 
-from general_bot.infra.ffmpeg import create_audio_variant, probe_audio_sample_rate
-from general_bot.infra.s3 import Key, Prefix, S3Client, S3ContentType, S3ObjectNotFoundError
+from timeline_hub.infra.ffmpeg import create_audio_variant, probe_audio_sample_rate
+from timeline_hub.infra.s3 import Key, Prefix, S3Client, S3ContentType, S3ObjectNotFoundError
 
 _TRACKS_PREFIX = 'tracks'
 _PRESETS_FILENAME = 'presets.json'

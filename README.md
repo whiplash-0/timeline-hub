@@ -1,10 +1,10 @@
-# General Bot
+# Timeline Hub
 
 Deterministic Telegram bot for storing, normalizing, and retrieving video clips through a fixed-layout Telegram UI and a structured S3-backed archive.
 
 ## Overview
 
-`general-bot` is built around a narrow but intentionally opinionated workflow:
+`timeline-hub` is built around a narrow but intentionally opinionated workflow:
 
 - users send video clips in a private chat
 - the bot briefly buffers incoming messages, reconstructs Telegram media albums, and presents a single action menu
@@ -48,7 +48,7 @@ At runtime, Telegram updates enter handlers, handlers translate them into domain
 ## Project structure
 
 src/
-  general_bot/
+  timeline_hub/
     app.py
     settings.py
     domain.py
@@ -102,13 +102,13 @@ Optional settings used by the code include:
 
 Run the bot through the package entry point:
 
-uv run python -m general_bot
+uv run python -m timeline_hub
 
 For the development bot token:
 
-uv run python -m general_bot --dev
+uv run python -m timeline_hub --dev
 
-The main entry point is `src/general_bot/__main__.py`, which delegates to `general_bot.app.run()`.
+The main entry point is `src/timeline_hub/__main__.py`, which delegates to `timeline_hub.app.run()`.
 
 ## Development
 

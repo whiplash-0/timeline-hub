@@ -5,7 +5,7 @@ from datetime import timedelta
 import pytest
 from loguru import logger
 
-from general_bot.infra.tasks import TaskFailure, TaskScheduler, TaskSupervisor
+from timeline_hub.infra.tasks import TaskFailure, TaskScheduler, TaskSupervisor
 
 
 @pytest.fixture

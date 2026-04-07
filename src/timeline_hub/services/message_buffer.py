@@ -1,6 +1,6 @@
 from aiogram.types import Message
 
-from general_bot.types import ChatId
+from timeline_hub.types import ChatId
 
 type Messages = list[Message]
 type MessageGroup = tuple[Message, ...]

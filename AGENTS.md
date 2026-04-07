@@ -299,12 +299,12 @@ For internal packages:
 - do not re-export internal symbols for convenience
 
 Preferred:
-- `from general_bot.infra.tasks import TaskScheduler`
-- `from general_bot.infra.tasks import TaskSupervisor`
-- `from general_bot.infra.s3 import S3Client`
+- `from timeline_hub.infra.tasks import TaskScheduler`
+- `from timeline_hub.infra.tasks import TaskSupervisor`
+- `from timeline_hub.infra.s3 import S3Client`
 
 Avoid:
-- `from general_bot.infra import TaskScheduler`
+- `from timeline_hub.infra import TaskScheduler`
 
 Review feedback should be grouped as:
 - critical issues

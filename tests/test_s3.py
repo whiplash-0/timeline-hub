@@ -5,8 +5,8 @@ from typing import Self
 import pytest
 from botocore.exceptions import ClientError
 
-import general_bot.infra.s3 as s3_module
-from general_bot.infra.s3 import (
+import timeline_hub.infra.s3 as s3_module
+from timeline_hub.infra.s3 import (
     S3BatchDeleteError,
     S3Client,
     S3Config,

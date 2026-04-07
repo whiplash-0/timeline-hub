@@ -7,7 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
 from aiogram.types import InlineKeyboardButton, Message
 
-from general_bot.handlers.clips.common import (
+from timeline_hub.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
     BACK_CALLBACK_VALUE,
     UNSET,
@@ -21,7 +21,7 @@ from general_bot.handlers.clips.common import (
     set_flow_context,
     validate_flow_state,
 )
-from general_bot.services.clip_store import ClipGroup, ClipSubGroup, Scope, Season, SubSeason, Universe
+from timeline_hub.services.clip_store import ClipGroup, ClipSubGroup, Scope, Season, SubSeason, Universe
 
 type MenuCallbackPacker = Callable[[MenuAction, MenuStep, str], str]
 type ShowMenu = Callable[..., Awaitable[bool]]

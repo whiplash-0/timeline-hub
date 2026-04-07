@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from general_bot.infra import ffmpeg as ffmpeg_module
+from timeline_hub.infra import ffmpeg as ffmpeg_module
 
 
 @pytest.mark.asyncio

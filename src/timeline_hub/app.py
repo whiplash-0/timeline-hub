@@ -10,14 +10,14 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import TelegramObject, User
 from loguru import logger
 
-from general_bot.handlers.router import router as handlers_router
-from general_bot.infra.s3 import S3Client, S3Config
-from general_bot.infra.tasks import TaskFailure, TaskScheduler, TaskSupervisor
-from general_bot.services.clip_store import ClipStore
-from general_bot.services.container import Services
-from general_bot.services.message_buffer import ChatMessageBuffer
-from general_bot.settings import Settings
-from general_bot.types import UserId
+from timeline_hub.handlers.router import router as handlers_router
+from timeline_hub.infra.s3 import S3Client, S3Config
+from timeline_hub.infra.tasks import TaskFailure, TaskScheduler, TaskSupervisor
+from timeline_hub.services.clip_store import ClipStore
+from timeline_hub.services.container import Services
+from timeline_hub.services.message_buffer import ChatMessageBuffer
+from timeline_hub.settings import Settings
+from timeline_hub.types import UserId
 
 
 class _AllowlistMiddleware(BaseMiddleware):

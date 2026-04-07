@@ -1,6 +1,6 @@
 from aiogram.types import Message
 
-from general_bot.services.message_buffer import ChatMessageBuffer
+from timeline_hub.services.message_buffer import ChatMessageBuffer
 
 
 def _message(message_id: int, *, chat_id: int, media_group_id: str | None = None) -> Message:

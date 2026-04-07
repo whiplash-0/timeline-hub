@@ -8,7 +8,7 @@ from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InputMediaVideo, Message
 
-from general_bot.handlers.clips.common import (
+from timeline_hub.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
     FLOW_GET,
     FLOW_PULL,
@@ -28,7 +28,7 @@ from general_bot.handlers.clips.common import (
     stacked_keyboard,
     width_reserved_text,
 )
-from general_bot.handlers.clips.flow import (
+from timeline_hub.handlers.clips.flow import (
     FlowMenuDefinition,
     available_group_seasons,
     available_group_years,
@@ -47,7 +47,7 @@ from general_bot.handlers.clips.flow import (
     validate_menu_flow_state,
     year_option_universe,
 )
-from general_bot.services.clip_store import (
+from timeline_hub.services.clip_store import (
     AudioNormalization,
     Clip,
     ClipGroup,
@@ -58,9 +58,9 @@ from general_bot.services.clip_store import (
     SubSeason,
     Universe,
 )
-from general_bot.services.container import Services
-from general_bot.settings import Settings
-from general_bot.types import ChatId
+from timeline_hub.services.container import Services
+from timeline_hub.settings import Settings
+from timeline_hub.types import ChatId
 
 router = Router()
 

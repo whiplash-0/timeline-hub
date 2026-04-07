@@ -4,9 +4,9 @@ import uuid
 
 import pytest
 
-import general_bot.services.track_store as track_store_module
-from general_bot.infra.s3 import S3Client, S3ObjectNotFoundError
-from general_bot.services.track_store import (
+import timeline_hub.services.track_store as track_store_module
+from timeline_hub.infra.s3 import S3Client, S3ObjectNotFoundError
+from timeline_hub.services.track_store import (
     AppliedPreset,
     FetchedVariant,
     FetchedVariants,

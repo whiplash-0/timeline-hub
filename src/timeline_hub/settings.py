@@ -4,7 +4,7 @@ from typing import Any, Self
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from general_bot.types import UserId
+from timeline_hub.types import UserId
 
 
 class S3Settings(BaseModel):
