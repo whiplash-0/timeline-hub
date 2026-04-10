@@ -87,7 +87,8 @@ class Track:
     artists: tuple[str, ...]
     title: str
     audio_bytes: bytes
-    cover_bytes: bytes
+    cover_bytes: bytes | None = None
+    album_id: TrackId | None = None
 
     def __post_init__(self) -> None:
         """Validate original track invariants for all construction paths."""
@@ -110,10 +111,22 @@ class Track:
         if not self.audio_bytes:
             raise ValueError('Track.audio_bytes must not be empty')
 
-        if not isinstance(self.cover_bytes, bytes):
-            raise ValueError('Track.cover_bytes must be bytes')
-        if not self.cover_bytes:
-            raise ValueError('Track.cover_bytes must not be empty')
+        has_cover_bytes = self.cover_bytes is not None
+        has_album_id = self.album_id is not None
+        if has_cover_bytes == has_album_id:
+            raise ValueError('Track requires exactly one of cover_bytes or album_id')
+
+        if has_cover_bytes:
+            if not isinstance(self.cover_bytes, bytes):
+                raise ValueError('Track.cover_bytes must be bytes')
+            if not self.cover_bytes:
+                raise ValueError('Track.cover_bytes must not be empty')
+
+        if has_album_id:
+            if not isinstance(self.album_id, str):
+                raise ValueError('Track.album_id must be a string')
+            if not self.album_id.strip():
+                raise ValueError('Track.album_id must be a non-empty string')
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +393,13 @@ class Presets:
 class ManifestEntry:
     """Single authoritative logical track row in a track-group manifest.
 
+    `album_id` is an opaque album-family identifier used only for cover
+    derivation at store time and cover synchronization during update(). It is
+    not a cover owner reference and does not imply cross-entry lookup
+    validity. It may outlive the original track id that first seeded it, so it
+    is intentionally not validated as a live reference to another current
+    manifest entry.
+
     `preset` stores the selected `AppliedPreset` metadata for this track family.
     It describes which preset identity/version applies and how many ordered
     variants that preset currently resolves to. It is not a source of truth for
@@ -401,6 +421,7 @@ class ManifestEntry:
     """
 
     id: TrackId
+    album_id: TrackId
     artists: tuple[str, ...]
     title: str
     sub_season: SubSeason
@@ -457,6 +478,7 @@ class Manifest:
             'data': [
                 {
                     'id': entry.id,
+                    'album_id': entry.album_id,
                     'artists': list(entry.artists),
                     'title': entry.title,
                     'sub_season': entry.sub_season.value,
@@ -498,6 +520,7 @@ class Manifest:
                 raise ValueError('manifest track entry must be an object')
             if set(raw_entry) != {
                 'id',
+                'album_id',
                 'artists',
                 'title',
                 'sub_season',
@@ -512,6 +535,11 @@ class Manifest:
             track_id = _parse_uuid7(
                 _expect_str(raw_entry['id'], field='id', context='manifest'),
                 field='id',
+                context='manifest',
+            )
+            album_id = _parse_uuid7(
+                _expect_str(raw_entry['album_id'], field='album_id', context='manifest'),
+                field='album_id',
                 context='manifest',
             )
             artists = _parse_track_artists(raw_entry['artists'], context='manifest')
@@ -544,6 +572,7 @@ class Manifest:
             entries.append(
                 ManifestEntry(
                     id=track_id,
+                    album_id=album_id,
                     artists=artists,
                     title=title,
                     sub_season=sub_season,
@@ -1007,11 +1036,16 @@ class TrackStore:
         sub_season: SubSeason,
         preset_id: PresetId | None = None,
     ) -> None:
-        """Store one original track plus its mandatory cover object.
+        """Store one original track plus its mandatory per-track cover object.
 
-        `track.audio_bytes` must already be Opus data and `track.cover_bytes` must already
-        be JPEG data. This phase treats those media formats as a caller
-        contract and does not perform expensive media validation.
+        `track.audio_bytes` must already be Opus data. Cover input is strict:
+        the caller must provide exactly one of `track.cover_bytes` or
+        `track.album_id`. When `track.cover_bytes` is provided it must already
+        be JPEG data. When `track.album_id` is provided, cover bytes are copied
+        from an existing track in the same manifest whose persisted
+        `album_id` matches. The persisted `album_id` remains an opaque stable
+        linking id, not a live foreign-key reference to whichever track first
+        seeded that album family.
 
         If `preset_id` is omitted, the current default preset is used for the
         new track's initial manifest metadata. If provided, it must refer to an
@@ -1022,6 +1056,10 @@ class TrackStore:
 
         Validation is strict and performed before any S3 writes. No resampling
         is performed.
+
+        Cover storage remains physically per-track. Even album reuse reads
+        bytes from an existing same-album track only to upload a fresh cover
+        object for the new track's own cover key.
 
         Store creates the target group implicitly by writing its first manifest
         if that group does not yet exist. Track and cover objects are uploaded
@@ -1068,9 +1106,25 @@ class TrackStore:
         manifest = await self._load_manifest_for_store(track_group_prefix)
         track_id = self._new_track_id(manifest=manifest)
         order = manifest.next_order(sub_season=sub_season)
+
+        if track.cover_bytes is not None:
+            cover_bytes = track.cover_bytes
+            album_id = track_id
+        else:
+            assert track.album_id is not None
+            album_entry = self._find_album_entry(manifest, album_id=track.album_id)
+            if album_entry is None:
+                raise ValueError(
+                    f'Album id {track.album_id} does not exist in group '
+                    f'{group.universe.value}-{group.year}-{int(group.season)}'
+                )
+            cover_bytes = await self._s3_client.get_bytes(self._cover_key(track_group_prefix, album_entry.id))
+            album_id = track.album_id
+
         manifest.append(
             ManifestEntry(
                 id=track_id,
+                album_id=album_id,
                 artists=track.artists,
                 title=track.title,
                 sub_season=sub_season,
@@ -1099,7 +1153,7 @@ class TrackStore:
         try:
             await self._s3_client.put_bytes(
                 cover_key,
-                track.cover_bytes,
+                cover_bytes,
                 content_type=S3ContentType.JPEG,
             )
         except Exception as error:
@@ -1143,7 +1197,10 @@ class TrackStore:
         This method mutates only the selected authoritative components for the
         provided `(group, track_id)`. Omitted fields remain unchanged.
         `instrumental_bytes` may either attach the first authoritative
-        instrumental or replace the existing one.
+        instrumental or replace the existing one. Cover updates are the one
+        album-linked exception: `cover_bytes` fans out across all current
+        manifest entries with the same `album_id`, while preserving one
+        physical cover object per track.
 
         Invariant:
             All stored audio must have a sample rate of exactly 48_000 Hz.
@@ -1191,7 +1248,6 @@ class TrackStore:
         # Set up the authoritative object keys and staged manifest state.
         track_key = self._track_key(track_group_prefix, track_id)
         instrumental_key = self._instrumental_key(track_group_prefix, track_id)
-        cover_key = self._cover_key(track_group_prefix, track_id)
         manifest_key = self._manifest_key(track_group_prefix)
         touched_keys: list[Key] = []
         updated_entry = entry
@@ -1303,28 +1359,37 @@ class TrackStore:
                 has_instrumental_variants=False,
             )
 
-        # Cover updates do not affect variant state.
+        # Cover updates do not affect variant state. Album linkage is used only
+        # for synchronized cover fan-out; every track still keeps its own
+        # physical cover key.
         if validated_cover_bytes is not None:
-            try:
-                await self._s3_client.put_bytes(
-                    cover_key,
-                    validated_cover_bytes,
-                    content_type=S3ContentType.JPEG,
-                )
-            except Exception as error:
-                if (
-                    sync_error := self._build_update_sync_error(
-                        error,
-                        stage='cover_upload',
-                        track_id=track_id,
-                        touched_keys=touched_keys,
-                        manifest_key=manifest_key,
-                        note_prefix='Cover upload error',
+            target_cover_keys = self._album_cover_keys(
+                manifest,
+                track_group_prefix=track_group_prefix,
+                album_id=entry.album_id,
+            )
+            for cover_key in target_cover_keys:
+                try:
+                    await self._s3_client.put_bytes(
+                        cover_key,
+                        validated_cover_bytes,
+                        content_type=S3ContentType.JPEG,
                     )
-                ) is None:
-                    raise
-                raise sync_error from error
-            touched_keys.append(cover_key)
+                except Exception as error:
+                    if (
+                        sync_error := self._build_update_sync_error(
+                            error,
+                            stage='cover_upload',
+                            track_id=track_id,
+                            touched_keys=touched_keys,
+                            assume_touched_keys=target_cover_keys,
+                            manifest_key=manifest_key,
+                            note_prefix='Cover upload error',
+                        )
+                    ) is None:
+                        raise
+                    raise sync_error from error
+                touched_keys.append(cover_key)
 
         # Commit the staged manifest only after all requested object mutations succeed.
         rewritten_manifest = self._replace_manifest_entry(
@@ -1509,7 +1574,9 @@ class TrackStore:
         provided `(group, track_id)`. This method deletes only the objects that
         entry implies and rewrites manifest state accordingly. It does not scan
         storage for stray or orphaned objects left behind by earlier sync
-        failures.
+        failures. `album_id` does not change this: remove() still deletes only
+        the selected track's own cover object and does not reinterpret album
+        linkage as shared physical ownership.
 
         Raises:
             TrackManifestCorruptedError: If the target group's manifest exists but is malformed.
@@ -1793,6 +1860,10 @@ class TrackStore:
         manifest persistence fails, orphaned variant objects may remain in
         storage for manual cleanup, matching the store path's existing staged
         write semantics.
+
+        Cover reads intentionally stay per-track. Album linkage is not used as
+        a fetch-time indirection because each track stores its own physical
+        cover copy.
 
         Raises:
             TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
@@ -2240,6 +2311,26 @@ class TrackStore:
 
         raise ValueError(
             f'Track id {track_id} does not exist in group {group.universe.value}-{group.year}-{int(group.season)}'
+        )
+
+    def _find_album_entry(self, manifest: Manifest, *, album_id: TrackId) -> ManifestEntry | None:
+        for entry in manifest:
+            if entry.album_id == album_id:
+                return entry
+        return None
+
+    def _album_entries(self, manifest: Manifest, *, album_id: TrackId) -> tuple[ManifestEntry, ...]:
+        return tuple(entry for entry in manifest if entry.album_id == album_id)
+
+    def _album_cover_keys(
+        self,
+        manifest: Manifest,
+        *,
+        track_group_prefix: Prefix,
+        album_id: TrackId,
+    ) -> tuple[Key, ...]:
+        return tuple(
+            self._cover_key(track_group_prefix, entry.id) for entry in self._album_entries(manifest, album_id=album_id)
         )
 
     def _is_applied_preset_current(
