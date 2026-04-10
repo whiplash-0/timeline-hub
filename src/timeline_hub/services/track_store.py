@@ -1861,6 +1861,10 @@ class TrackStore:
         storage for manual cleanup, matching the store path's existing staged
         write semantics.
 
+        This method may perform object and manifest writes during variant
+        generation. It is not a pure read operation. Concurrent operations on
+        the same `TrackGroup` are not supported and may lead to lost updates.
+
         Cover reads intentionally stay per-track. Album linkage is not used as
         a fetch-time indirection because each track stores its own physical
         cover copy.
