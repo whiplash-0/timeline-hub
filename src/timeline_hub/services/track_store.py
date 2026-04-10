@@ -15,9 +15,6 @@ _PRESETS_FILENAME = 'presets.json'
 _MANIFEST_FILENAME = 'manifest.json'
 _COVER_SUFFIX = '-cover'
 _INSTRUMENTAL_SUFFIX = '-instrumental'
-_VARIANT_MODE_SEPARATOR = '-'
-_TRACK_GROUP_SEPARATOR = '-'
-_TRACK_IDENTITY_SEPARATOR = '--'
 
 type TrackId = str
 type PresetId = int
@@ -2134,8 +2131,8 @@ class TrackStore:
         abstraction and carries no extension handling. Higher layers own any
         extension policy; `TrackStore` does not participate in it.
         """
-        track_group = _TRACK_GROUP_SEPARATOR.join((group.universe.value, str(group.year), str(int(group.season))))
-        return _TRACK_IDENTITY_SEPARATOR.join((track_group, track_id))
+        track_group = '-'.join((group.universe.value, str(group.year), str(int(group.season))))
+        return '--'.join((track_group, track_id))
 
     @staticmethod
     def string_to_track_identity(value: str) -> tuple[TrackGroup, TrackId]:
@@ -2152,21 +2149,16 @@ class TrackStore:
         if '.' in value:
             raise ValueError('track identity `value` must not contain extensions')
 
-        parts = value.split(_TRACK_IDENTITY_SEPARATOR)
+        parts = value.split('--')
         if len(parts) != 2:
-            raise ValueError(f'track identity `value` must contain exactly one {_TRACK_IDENTITY_SEPARATOR!r} separator')
+            raise ValueError("track identity `value` must contain exactly one '--' separator")
 
         group_text, track_id_text = parts
-        if (
-            not group_text
-            or not track_id_text
-            or group_text.endswith(_TRACK_GROUP_SEPARATOR)
-            or track_id_text.startswith(_TRACK_GROUP_SEPARATOR)
-        ):
-            raise ValueError(f'track identity `value` must contain exactly one {_TRACK_IDENTITY_SEPARATOR!r} separator')
+        if not group_text or not track_id_text or group_text.endswith('-') or track_id_text.startswith('-'):
+            raise ValueError("track identity `value` must contain exactly one '--' separator")
 
         try:
-            universe_text, year_text, season_text = group_text.split(_TRACK_GROUP_SEPARATOR)
+            universe_text, year_text, season_text = group_text.split('-')
         except ValueError as error:
             raise ValueError('track identity `value` has malformed group segment') from error
 
@@ -2250,7 +2242,7 @@ class TrackStore:
         self._manifest_cache[track_group_prefix] = manifest.copy()
 
     def _track_group_prefix(self, *, universe: TrackUniverse, year: int, season: Season) -> Prefix:
-        track_group = _TRACK_GROUP_SEPARATOR.join((universe.value, str(year), str(int(season))))
+        track_group = '-'.join((universe.value, str(year), str(int(season))))
         return S3Client.join(_TRACKS_PREFIX, track_group)
 
     def _parse_track_group_prefix(self, prefix: Prefix) -> TrackGroup:
@@ -2264,7 +2256,7 @@ class TrackStore:
 
         track_group = remaining_segments[0]
         try:
-            universe_text, year_text, season_text = track_group.split(_TRACK_GROUP_SEPARATOR)
+            universe_text, year_text, season_text = track_group.split('-')
             universe = TrackUniverse(universe_text)
             year = int(year_text)
             season = Season(int(season_text))
@@ -2291,15 +2283,12 @@ class TrackStore:
 
     def _variant_key(self, track_group_prefix: Prefix, track_id: TrackId, *, index: int) -> Key:
         validated_index = _expect_positive_int(index, field='index', context='variant key')
-        object_name = f'{track_id}{_VARIANT_MODE_SEPARATOR}variant{_VARIANT_MODE_SEPARATOR}{validated_index}'
+        object_name = f'{track_id}-variant-{validated_index}'
         return S3Client.join(track_group_prefix, object_name)
 
     def _instrumental_variant_key(self, track_group_prefix: Prefix, track_id: TrackId, *, index: int) -> Key:
         validated_index = _expect_positive_int(index, field='index', context='instrumental variant key')
-        object_name = (
-            f'{track_id}{_VARIANT_MODE_SEPARATOR}instrumental{_VARIANT_MODE_SEPARATOR}'
-            f'variant{_VARIANT_MODE_SEPARATOR}{validated_index}'
-        )
+        object_name = f'{track_id}-instrumental-variant-{validated_index}'
         return S3Client.join(track_group_prefix, object_name)
 
     def _new_track_id(self, *, manifest: Manifest) -> TrackId:
