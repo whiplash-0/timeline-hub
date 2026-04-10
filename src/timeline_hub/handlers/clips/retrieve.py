@@ -49,10 +49,11 @@ from timeline_hub.handlers.clips.flow import (
 )
 from timeline_hub.services.clip_store import (
     AudioNormalization,
-    Clip,
     ClipGroup,
     ClipGroupNotFoundError,
+    ClipStore,
     ClipSubGroup,
+    FetchedClip,
     Scope,
     Season,
     SubSeason,
@@ -665,6 +666,8 @@ async def _send_retrieve_scopes(
         await _send_fetched_clip_batches(
             bot=bot,
             chat_id=chat_id,
+            group=clip_group,
+            sub_group=ClipSubGroup(sub_season=sub_season, scope=scope),
             clip_batches=services.clip_store.fetch(
                 clip_group,
                 ClipSubGroup(sub_season=sub_season, scope=scope),
@@ -679,17 +682,27 @@ async def _send_fetched_clip_batches(
     *,
     bot: Bot,
     chat_id: ChatId,
-    clip_batches: AsyncIterator[list[Clip]],
+    group: ClipGroup,
+    sub_group: ClipSubGroup,
+    clip_batches: AsyncIterator[list[FetchedClip]],
 ) -> None:
     async for batch in clip_batches:
-        await _send_stored_clip_batch(bot=bot, chat_id=chat_id, clips=batch)
+        await _send_stored_clip_batch(
+            bot=bot,
+            chat_id=chat_id,
+            group=group,
+            sub_group=sub_group,
+            clips=batch,
+        )
 
 
 async def _send_stored_clip_batch(
     *,
     bot: Bot,
     chat_id: ChatId,
-    clips: Sequence[Clip],
+    group: ClipGroup,
+    sub_group: ClipSubGroup,
+    clips: Sequence[FetchedClip],
 ) -> None:
     if not clips:
         raise ValueError('`clips` must not be empty')
@@ -698,7 +711,7 @@ async def _send_stored_clip_batch(
         clip = clips[0]
         await bot.send_video(
             chat_id=chat_id,
-            video=BufferedInputFile(clip.bytes, filename=clip.filename),
+            video=BufferedInputFile(clip.bytes, filename=_fetched_clip_filename(group, sub_group, clip.id)),
         )
         return
 
@@ -706,11 +719,16 @@ async def _send_stored_clip_batch(
         chat_id=chat_id,
         media=[
             InputMediaVideo(
-                media=BufferedInputFile(clip.bytes, filename=clip.filename),
+                media=BufferedInputFile(clip.bytes, filename=_fetched_clip_filename(group, sub_group, clip.id)),
             )
             for clip in clips
         ],
     )
+
+
+def _fetched_clip_filename(group: ClipGroup, sub_group: ClipSubGroup, clip_id: str) -> str:
+    identity = ClipStore.clip_identity_to_string(group, sub_group, clip_id)
+    return f'{identity}.mp4'
 
 
 async def _retrieve_sub_groups(

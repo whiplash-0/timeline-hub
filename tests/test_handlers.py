@@ -59,22 +59,23 @@ from timeline_hub.handlers.clips.retrieve import (
 from timeline_hub.handlers.router import on_dummy_button
 from timeline_hub.services.clip_store import (
     AudioNormalization,
-    Clip,
     ClipGroup,
+    ClipStore,
     ClipSubGroup,
-    DuplicateFilenamesError,
-    InvalidFilenamesError,
-    MixedClipGroupsError,
+    FetchedClip,
     ReconcileResult,
     Scope,
     Season,
     StoreResult,
     SubSeason,
     Universe,
-    UnknownClipsError,
 )
 from timeline_hub.services.container import Services
 from timeline_hub.services.message_buffer import ChatMessageBuffer
+
+_CLIP_ID_1 = '018f05c1f1a37b348d291f53a1c9d0e1'
+_CLIP_ID_2 = '018f05c1f1a37b348d291f53a1c9d0e2'
+_CLIP_ID_3 = '018f05c1f1a37b348d291f53a1c9d0e3'
 
 
 class _FakeState:
@@ -136,7 +137,7 @@ class _RecordingBot:
 class _RetrieveClipStore:
     def __init__(
         self,
-        batches_by_scope: dict[Scope, list[list[Clip]]],
+        batches_by_scope: dict[Scope, list[list[FetchedClip]]],
         *,
         sub_groups: list[ClipSubGroup] | None = None,
     ) -> None:
@@ -158,7 +159,7 @@ class _RetrieveClipStore:
                 yield batch
                 continue
 
-            yield [Clip(filename=clip.filename, bytes=b'normalized:' + clip.bytes) for clip in batch]
+            yield [FetchedClip(id=clip.id, bytes=b'normalized:' + clip.bytes) for clip in batch]
 
     async def list_sub_groups(self, group: ClipGroup) -> list[ClipSubGroup]:
         return list(self.sub_groups)
@@ -176,7 +177,7 @@ class _ProduceClipStore:
         self,
         *,
         store_results: list[StoreResult],
-        fetched_batches: list[list[Clip]],
+        fetched_batches: list[list[FetchedClip]],
     ) -> None:
         self.events: list[tuple[str, object]] = []
         self._store_results = iter(store_results)
@@ -184,7 +185,7 @@ class _ProduceClipStore:
         self.fetch_calls: list[tuple[ClipGroup, ClipSubGroup, tuple[str, ...] | None, AudioNormalization | None]] = []
 
     async def store(self, clips, *, group: ClipGroup, sub_group: ClipSubGroup) -> StoreResult:
-        self.events.append(('store', ([clip.filename for clip in clips], group, sub_group)))
+        self.events.append(('store', (list(clips), group, sub_group)))
         return next(self._store_results)
 
     async def compact(
@@ -213,7 +214,7 @@ class _ProduceClipStore:
                 yield batch
                 continue
 
-            yield [Clip(filename=clip.filename, bytes=b'normalized:' + clip.bytes) for clip in batch]
+            yield [FetchedClip(id=clip.id, bytes=b'normalized:' + clip.bytes) for clip in batch]
 
 
 def _services(
@@ -239,6 +240,10 @@ def _settings(**overrides: object) -> SimpleNamespace:
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def _stored_filename(group: ClipGroup, sub_group: ClipSubGroup, clip_id: str) -> str:
+    return f'{ClipStore.clip_identity_to_string(group, sub_group, clip_id)}.mp4'
 
 
 def _fake_message(
@@ -1175,7 +1180,6 @@ async def test_compact_action_resends_only_videos_by_file_id_in_original_order()
     buffer.flush_grouped = Mock(wraps=buffer.flush_grouped)
     clip_store = SimpleNamespace(
         compact=AsyncMock(side_effect=AssertionError('Compact must not use ClipStore.compact')),
-        derive_group=AsyncMock(side_effect=AssertionError('Compact must not use ClipStore.derive_group')),
         list_groups=AsyncMock(side_effect=AssertionError('Compact must not use ClipStore.list_groups')),
         list_sub_groups=AsyncMock(side_effect=AssertionError('Compact must not use ClipStore.list_sub_groups')),
         reconcile=AsyncMock(side_effect=AssertionError('Compact must not use ClipStore.reconcile')),
@@ -1209,7 +1213,6 @@ async def test_compact_action_resends_only_videos_by_file_id_in_original_order()
     bot.download_file.assert_not_awaited()
     clip_store.store.assert_not_awaited()
     clip_store.compact.assert_not_awaited()
-    clip_store.derive_group.assert_not_awaited()
     clip_store.reconcile.assert_not_awaited()
 
 
@@ -1406,7 +1409,7 @@ async def test_route_action_stores_clips_in_caption_route_order_across_message_g
     assert services.chat_message_buffer.peek(77) == []
     clip_store.store.assert_awaited_once()
     stored_clips = clip_store.store.await_args.args[0]
-    assert [clip.filename for clip in stored_clips] == ['one.mp4', 'two.mp4', 'three.mp4']
+    assert stored_clips == [b'one', b'two', b'three']
     assert clip_store.store.await_args.kwargs['group'] == ClipGroup(
         universe=Universe.WEST,
         year=2025,
@@ -1499,8 +1502,8 @@ async def test_route_action_splits_store_calls_when_caption_route_overrides() ->
     assert clip_store.store.await_count == 2
     first_batch = clip_store.store.await_args_list[0].args[0]
     second_batch = clip_store.store.await_args_list[1].args[0]
-    assert [clip.filename for clip in first_batch] == ['one.mp4', 'two.mp4']
-    assert [clip.filename for clip in second_batch] == ['three.mp4', 'four.mp4']
+    assert first_batch == [b'one', b'two']
+    assert second_batch == [b'three', b'four']
     assert clip_store.store.await_args_list[0].kwargs['group'] == ClipGroup(
         universe=Universe.WEST,
         year=2025,
@@ -1592,13 +1595,8 @@ async def test_route_action_chunks_long_single_route_group_without_duplicate_pro
     )
 
     assert clip_store.store.await_count == 2
-    assert [clip.filename for clip in clip_store.store.await_args_list[0].args[0]] == [
-        f'clip-{index}.mp4' for index in range(1, 9)
-    ]
-    assert [clip.filename for clip in clip_store.store.await_args_list[1].args[0]] == [
-        'clip-9.mp4',
-        'clip-10.mp4',
-    ]
+    assert clip_store.store.await_args_list[0].args[0] == [f'clip-{index}'.encode() for index in range(1, 9)]
+    assert clip_store.store.await_args_list[1].args[0] == [b'clip-9', b'clip-10']
     assert all(
         call.kwargs['group'] == ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
         for call in clip_store.store.await_args_list
@@ -1670,11 +1668,9 @@ async def test_route_action_chunks_per_route_group_without_crossing_route_bounda
     )
 
     assert clip_store.store.await_count == 3
-    assert [clip.filename for clip in clip_store.store.await_args_list[0].args[0]] == [
-        f'west-{index}.mp4' for index in range(1, 9)
-    ]
-    assert [clip.filename for clip in clip_store.store.await_args_list[1].args[0]] == ['west-9.mp4']
-    assert [clip.filename for clip in clip_store.store.await_args_list[2].args[0]] == ['east-1.mp4']
+    assert clip_store.store.await_args_list[0].args[0] == [f'clip-{index}'.encode() for index in range(1, 9)]
+    assert clip_store.store.await_args_list[1].args[0] == [b'clip-9']
+    assert clip_store.store.await_args_list[2].args[0] == [b'clip-10']
     assert clip_store.store.await_args_list[0].kwargs['group'] == ClipGroup(
         universe=Universe.WEST,
         year=2025,
@@ -1769,9 +1765,9 @@ async def test_route_action_updates_active_route_from_standalone_text_and_clip_c
     )
 
     assert clip_store.store.await_count == 3
-    assert [clip.filename for clip in clip_store.store.await_args_list[0].args[0]] == ['one.mp4']
-    assert [clip.filename for clip in clip_store.store.await_args_list[1].args[0]] == ['two.mp4']
-    assert [clip.filename for clip in clip_store.store.await_args_list[2].args[0]] == ['three.mp4', 'four.mp4']
+    assert clip_store.store.await_args_list[0].args[0] == [b'one']
+    assert clip_store.store.await_args_list[1].args[0] == [b'two']
+    assert clip_store.store.await_args_list[2].args[0] == [b'three', b'four']
     assert clip_store.store.await_args_list[0].kwargs['group'] == ClipGroup(
         universe=Universe.WEST,
         year=2025,
@@ -1920,7 +1916,7 @@ async def test_route_action_uses_latest_valid_pre_clip_text_before_first_video()
         state,
     )
 
-    assert [clip.filename for clip in clip_store.store.await_args.args[0]] == ['one.mp4']
+    assert clip_store.store.await_args.args[0] == [b'one']
     assert clip_store.store.await_args.kwargs['group'] == ClipGroup(
         universe=Universe.WEST,
         year=2025,
@@ -2270,21 +2266,28 @@ async def test_store_entry_places_newest_year_in_top_right_slot() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reconcile_entry_derives_group_and_opens_sub_season_menu() -> None:
+async def test_reconcile_entry_accepts_same_group_clips_from_different_sub_groups() -> None:
     message = _fake_message(text='Got 1 clip', message_id=31)
     callback = _fake_callback(message)
     state = _FakeState()
     bot = AsyncMock()
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    first_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
+    second_sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.EXTRA)
     buffer = ChatMessageBuffer()
     buffer.append(
-        _fake_message(chat_id=1, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        _fake_message(
+            chat_id=1,
+            message_id=1,
+            video=_fake_video(file_id='f1', file_name=_stored_filename(clip_group, first_sub_group, _CLIP_ID_1)),
+        ),
         chat_id=1,
     )
     buffer.append(
         _fake_message(
             chat_id=1,
             message_id=2,
-            video=_fake_video(file_id='f2', file_name='two.mp4'),
+            video=_fake_video(file_id='f2', file_name=_stored_filename(clip_group, second_sub_group, _CLIP_ID_2)),
             media_group_id='g1',
         ),
         chat_id=1,
@@ -2293,14 +2296,12 @@ async def test_reconcile_entry_derives_group_and_opens_sub_season_menu() -> None
         _fake_message(
             chat_id=1,
             message_id=3,
-            video=_fake_video(file_id='f3', file_name='three.mp4'),
+            video=_fake_video(file_id='f3', file_name=_stored_filename(clip_group, second_sub_group, _CLIP_ID_3)),
             media_group_id='g1',
         ),
         chat_id=1,
     )
-    clip_store = SimpleNamespace(
-        derive_group=AsyncMock(return_value=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1))
-    )
+    clip_store = SimpleNamespace()
     services = _services(clip_store=clip_store, buffer=buffer)
     settings = _settings()
     pre_flush_buffer_version = services.chat_message_buffer.version(1)
@@ -2318,10 +2319,9 @@ async def test_reconcile_entry_derives_group_and_opens_sub_season_menu() -> None
         message.edit_text.await_args.kwargs,
         _selected_kwargs('Reconcile', 'West', '2025', '1', prompt='Select sub-season:', message_width=35),
     )
-    clip_store.derive_group.assert_awaited_once_with([['one.mp4'], ['two.mp4', 'three.mp4']])
     assert state.current_state == ReconcileClipFlow.sub_season.state
-    assert state.data['clip_group'] == ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
-    assert state.data['filename_batches'] == [['one.mp4'], ['two.mp4', 'three.mp4']]
+    assert state.data['clip_group'] == clip_group
+    assert state.data['clip_id_batches'] == [[_CLIP_ID_1], [_CLIP_ID_2, _CLIP_ID_3]]
     assert state.data['buffer_version'] == pre_flush_buffer_version
     assert [message.message_id for message in services.chat_message_buffer.peek(1)] == [1, 2, 3]
 
@@ -2333,20 +2333,26 @@ async def test_reconcile_entry_prefers_current_buffered_clips_over_stored_reconc
     state = _FakeState()
     await state.update_data(
         clip_group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-        filename_batches=[['old-one.mp4']],
+        clip_id_batches=[[_CLIP_ID_1]],
         buffer_version=0,
     )
     bot = AsyncMock()
+    clip_group = ClipGroup(universe=Universe.EAST, year=2025, season=Season.S2)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
     buffer = ChatMessageBuffer()
     buffer.append(
-        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='new-one.mp4')),
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            video=_fake_video(file_id='f1', file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_1)),
+        ),
         chat_id=77,
     )
     buffer.append(
         _fake_message(
             chat_id=77,
             message_id=2,
-            video=_fake_video(file_id='f2', file_name='new-two.mp4'),
+            video=_fake_video(file_id='f2', file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_2)),
             media_group_id='g1',
         ),
         chat_id=77,
@@ -2355,14 +2361,12 @@ async def test_reconcile_entry_prefers_current_buffered_clips_over_stored_reconc
         _fake_message(
             chat_id=77,
             message_id=3,
-            video=_fake_video(file_id='f3', file_name='new-three.mp4'),
+            video=_fake_video(file_id='f3', file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_3)),
             media_group_id='g1',
         ),
         chat_id=77,
     )
-    clip_store = SimpleNamespace(
-        derive_group=AsyncMock(return_value=ClipGroup(universe=Universe.EAST, year=2025, season=Season.S2))
-    )
+    clip_store = SimpleNamespace()
     services = _services(clip_store=clip_store, buffer=buffer)
 
     await on_intake_action(
@@ -2374,30 +2378,29 @@ async def test_reconcile_entry_prefers_current_buffered_clips_over_stored_reconc
         state,
     )
 
-    clip_store.derive_group.assert_awaited_once_with([['new-one.mp4'], ['new-two.mp4', 'new-three.mp4']])
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
         _selected_kwargs('Reconcile', 'East', '2025', '2', prompt='Select sub-season:', message_width=35),
     )
-    assert state.data['clip_group'] == ClipGroup(universe=Universe.EAST, year=2025, season=Season.S2)
-    assert state.data['filename_batches'] == [['new-one.mp4'], ['new-two.mp4', 'new-three.mp4']]
+    assert state.data['clip_group'] == clip_group
+    assert state.data['clip_id_batches'] == [[_CLIP_ID_1], [_CLIP_ID_2, _CLIP_ID_3]]
     assert [message.message_id for message in services.chat_message_buffer.peek(77)] == [1, 2, 3]
 
 
 @pytest.mark.asyncio
-async def test_reconcile_entry_reuses_stored_state_when_current_buffer_has_no_filename_batches() -> None:
+async def test_reconcile_entry_reuses_stored_state_when_current_buffer_has_no_clip_id_batches() -> None:
     message = _fake_message(text='Got 1 clip', chat_id=77, message_id=36)
     callback = _fake_callback(message)
     state = _FakeState()
     await state.update_data(
         clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
-        filename_batches=[['one.mp4'], ['two.mp4', 'three.mp4']],
+        clip_id_batches=[[_CLIP_ID_1], [_CLIP_ID_2, _CLIP_ID_3]],
         buffer_version=0,
     )
     buffer = ChatMessageBuffer()
     buffer.append(_fake_message(chat_id=77, message_id=1, text='note'), chat_id=77)
     buffer.append(_fake_message(chat_id=77, message_id=2, text='ignored', media_group_id='g1'), chat_id=77)
-    clip_store = SimpleNamespace(derive_group=AsyncMock(side_effect=AssertionError('must not re-derive')))
+    clip_store = SimpleNamespace()
     services = _services(clip_store=clip_store, buffer=buffer)
 
     await on_intake_action(
@@ -2409,12 +2412,11 @@ async def test_reconcile_entry_reuses_stored_state_when_current_buffer_has_no_fi
         state,
     )
 
-    clip_store.derive_group.assert_not_awaited()
     _assert_format_kwargs(
         message.edit_text.await_args.kwargs,
         _selected_kwargs('Reconcile', 'West', '2025', '1', prompt='Select sub-season:', message_width=35),
     )
-    assert state.data['filename_batches'] == [['one.mp4'], ['two.mp4', 'three.mp4']]
+    assert state.data['clip_id_batches'] == [[_CLIP_ID_1], [_CLIP_ID_2, _CLIP_ID_3]]
 
 
 @pytest.mark.asyncio
@@ -2423,17 +2425,23 @@ async def test_reconcile_entry_ignores_non_video_buffered_messages() -> None:
     callback = _fake_callback(message)
     state = _FakeState()
     bot = AsyncMock()
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
     buffer = ChatMessageBuffer()
     buffer.append(_fake_message(chat_id=77, message_id=1, text='note'), chat_id=77)
     buffer.append(
-        _fake_message(chat_id=77, message_id=2, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            video=_fake_video(file_id='f1', file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_1)),
+        ),
         chat_id=77,
     )
     buffer.append(
         _fake_message(
             chat_id=77,
             message_id=3,
-            video=_fake_video(file_id='f2', file_name='two.mp4'),
+            video=_fake_video(file_id='f2', file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_2)),
             media_group_id='g1',
         ),
         chat_id=77,
@@ -2443,14 +2451,12 @@ async def test_reconcile_entry_ignores_non_video_buffered_messages() -> None:
         _fake_message(
             chat_id=77,
             message_id=5,
-            video=_fake_video(file_id='f3', file_name='three.mp4'),
+            video=_fake_video(file_id='f3', file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_3)),
             media_group_id='g1',
         ),
         chat_id=77,
     )
-    clip_store = SimpleNamespace(
-        derive_group=AsyncMock(return_value=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1))
-    )
+    clip_store = SimpleNamespace()
     services = _services(clip_store=clip_store, buffer=buffer)
 
     await on_intake_action(
@@ -2462,7 +2468,6 @@ async def test_reconcile_entry_ignores_non_video_buffered_messages() -> None:
         state,
     )
 
-    clip_store.derive_group.assert_awaited_once_with([['one.mp4'], ['two.mp4', 'three.mp4']])
     bot.get_file.assert_not_awaited()
     bot.download_file.assert_not_awaited()
 
@@ -2472,14 +2477,18 @@ async def test_reconcile_sub_season_selection_becomes_stale_when_buffer_changes_
     message = _fake_message(text='Got 1 clip', chat_id=77, message_id=37)
     callback = _fake_callback(message)
     state = _FakeState()
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
     buffer = ChatMessageBuffer()
     buffer.append(
-        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            video=_fake_video(file_id='f1', file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_1)),
+        ),
         chat_id=77,
     )
-    clip_store = SimpleNamespace(
-        derive_group=AsyncMock(return_value=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1))
-    )
+    clip_store = SimpleNamespace()
     services = _services(clip_store=clip_store, buffer=buffer)
 
     await on_intake_action(
@@ -2492,7 +2501,11 @@ async def test_reconcile_sub_season_selection_becomes_stale_when_buffer_changes_
     )
 
     buffer.append(
-        _fake_message(chat_id=77, message_id=2, video=_fake_video(file_id='f2', file_name='two.mp4')),
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            video=_fake_video(file_id='f2', file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_2)),
+        ),
         chat_id=77,
     )
     await on_intake_menu(
@@ -2521,7 +2534,7 @@ async def test_reconcile_back_from_scope_returns_to_sub_season_menu() -> None:
         menu_message_id=32,
         sub_season=SubSeason.NONE,
         clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
-        filename_batches=[['one.mp4'], ['two.mp4', 'three.mp4']],
+        clip_id_batches=[[_CLIP_ID_1], [_CLIP_ID_2, _CLIP_ID_3]],
         buffer_version=0,
     )
     services = _services(clip_store=SimpleNamespace(), buffer=ChatMessageBuffer())
@@ -2552,11 +2565,11 @@ async def test_reconcile_back_from_sub_season_returns_to_clip_action_menu() -> N
         mode=FLOW_RECONCILE,
         menu_message_id=33,
         clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
-        filename_batches=[['one.mp4'], ['two.mp4', 'three.mp4']],
+        clip_id_batches=[[_CLIP_ID_1], [_CLIP_ID_2, _CLIP_ID_3]],
         buffer_version=0,
     )
     services = _services(
-        clip_store=SimpleNamespace(derive_group=AsyncMock(side_effect=AssertionError('must not re-derive'))),
+        clip_store=SimpleNamespace(),
         buffer=ChatMessageBuffer(),
     )
 
@@ -2589,7 +2602,7 @@ async def test_reconcile_back_from_sub_season_returns_to_clip_action_menu() -> N
     )
     assert state.current_state is None
     assert state.clear_count == 0
-    assert state.data['filename_batches'] == [['one.mp4'], ['two.mp4', 'three.mp4']]
+    assert state.data['clip_id_batches'] == [[_CLIP_ID_1], [_CLIP_ID_2, _CLIP_ID_3]]
     message.answer.assert_not_awaited()
 
 
@@ -2916,9 +2929,11 @@ async def test_pull_scope_all_with_one_scope_sends_single_scope_normally() -> No
         sub_season=SubSeason.NONE,
     )
     bot = _RecordingBot()
+    clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
     clip_store = _RetrieveClipStore(
-        {Scope.COLLECTION: [[Clip(filename='one.mp4', bytes=b'1')]]},
-        sub_groups=[ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)],
+        {Scope.COLLECTION: [[FetchedClip(id=_CLIP_ID_1, bytes=b'1')]]},
+        sub_groups=[clip_sub_group],
     )
     services = _services(clip_store=clip_store)
 
@@ -2938,14 +2953,14 @@ async def test_pull_scope_all_with_one_scope_sends_single_scope_normally() -> No
     )
     assert clip_store.calls == [
         (
-            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
+            clip_group,
+            clip_sub_group,
             None,
             None,
         )
     ]
     assert bot.events == [
-        ('video', (9, 'one.mp4')),
+        ('video', (9, _stored_filename(clip_group, clip_sub_group, _CLIP_ID_1))),
         ('message', (9, 'Done')),
     ]
     assert state.current_state is None
@@ -2966,10 +2981,12 @@ async def test_get_scope_all_requests_normalized_fetch_before_sending() -> None:
         universe=Universe.WEST,
         sub_season=SubSeason.NONE,
     )
+    clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
     bot = AsyncMock()
     clip_store = _RetrieveClipStore(
-        {Scope.COLLECTION: [[Clip(filename='one.mp4', bytes=b'one')]]},
-        sub_groups=[ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)],
+        {Scope.COLLECTION: [[FetchedClip(id=_CLIP_ID_1, bytes=b'one')]]},
+        sub_groups=[clip_sub_group],
     )
     services = _services(clip_store=clip_store)
 
@@ -2988,13 +3005,15 @@ async def test_get_scope_all_requests_normalized_fetch_before_sending() -> None:
     )
     assert clip_store.calls == [
         (
-            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
+            clip_group,
+            clip_sub_group,
             None,
             AudioNormalization(loudness=-14, bitrate=128),
         )
     ]
-    assert bot.send_video.await_args.kwargs['video'].filename == 'one.mp4'
+    assert bot.send_video.await_args.kwargs['video'].filename == _stored_filename(
+        clip_group, clip_sub_group, _CLIP_ID_1
+    )
     assert bot.send_video.await_args.kwargs['video'].data == b'normalized:one'
     bot.send_message.assert_awaited_with(chat_id=9, text='Done')
     assert state.current_state is None
@@ -3225,8 +3244,8 @@ async def test_store_scope_selection_aggregates_results_and_sends_exact_summary(
     assert clip_store.store.await_count == 2
     first_group = clip_store.store.await_args_list[0].args[0]
     second_group = clip_store.store.await_args_list[1].args[0]
-    assert [clip.filename for clip in first_group] == ['one.mp4']
-    assert [clip.filename for clip in second_group] == ['two.mp4', 'three.mp4']
+    assert first_group == [b'one']
+    assert second_group == [b'two', b'three']
     expected_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
     expected_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
     assert clip_store.store.await_args_list[0].kwargs['group'] == expected_group
@@ -3289,12 +3308,12 @@ async def test_produce_scope_selection_stores_then_fetches_only_new_subset_via_s
 
     clip_store = _ProduceClipStore(
         store_results=[
-            StoreResult(stored_count=1, duplicate_count=0, clip_ids=('id-1',)),
-            StoreResult(stored_count=2, duplicate_count=1, clip_ids=('id-2', 'id-3')),
+            StoreResult(stored_count=1, duplicate_count=0, clip_ids=(_CLIP_ID_1,)),
+            StoreResult(stored_count=2, duplicate_count=1, clip_ids=(_CLIP_ID_2, _CLIP_ID_3)),
         ],
         fetched_batches=[
-            [Clip(filename='one.mp4', bytes=b'one')],
-            [Clip(filename='two.mp4', bytes=b'two'), Clip(filename='three.mp4', bytes=b'three')],
+            [FetchedClip(id=_CLIP_ID_1, bytes=b'one')],
+            [FetchedClip(id=_CLIP_ID_2, bytes=b'two'), FetchedClip(id=_CLIP_ID_3, bytes=b'three')],
         ],
     )
     services = _services(clip_store=clip_store, buffer=buffer)
@@ -3337,13 +3356,32 @@ async def test_produce_scope_selection_stores_then_fetches_only_new_subset_via_s
         (
             ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
-            ('id-1', 'id-2', 'id-3'),
+            (_CLIP_ID_1, _CLIP_ID_2, _CLIP_ID_3),
             AudioNormalization(loudness=-14, bitrate=128),
         )
     ]
     shared_helper.assert_awaited_once()
+    assert shared_helper.await_args.kwargs['group'] == ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    assert shared_helper.await_args.kwargs['sub_group'] == ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)
     assert bot.send_video.await_args.kwargs['video'].data == b'normalized:one'
+    assert bot.send_video.await_args.kwargs['video'].filename == _stored_filename(
+        ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+        _CLIP_ID_1,
+    )
     sent_media = bot.send_media_group.await_args.kwargs['media']
+    assert [item.media.filename for item in sent_media] == [
+        _stored_filename(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            _CLIP_ID_2,
+        ),
+        _stored_filename(
+            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+            _CLIP_ID_3,
+        ),
+    ]
     assert [item.media.data for item in sent_media] == [b'normalized:two', b'normalized:three']
     bot.send_message.assert_awaited_once_with(chat_id=77, text='Done')
     assert state.current_state is None
@@ -3372,7 +3410,7 @@ async def test_produce_scope_selection_with_no_new_clips_sends_summary_only() ->
 
     clip_store = _ProduceClipStore(
         store_results=[StoreResult(stored_count=0, duplicate_count=1)],
-        fetched_batches=[[Clip(filename='unexpected.mp4', bytes=b'nope')]],
+        fetched_batches=[[FetchedClip(id=_CLIP_ID_1, bytes=b'nope')]],
     )
     services = _services(clip_store=clip_store, buffer=buffer)
     bot = AsyncMock()
@@ -3401,7 +3439,7 @@ async def test_produce_scope_selection_with_no_new_clips_sends_summary_only() ->
 
 
 @pytest.mark.asyncio
-async def test_store_scope_selection_preserves_missing_telegram_filename_behavior() -> None:
+async def test_store_scope_selection_stores_bytes_when_telegram_filename_is_missing() -> None:
     message = _fake_message(text='Select scope:', chat_id=77, message_id=50)
     callback = _fake_callback(message)
     state = _FakeState()
@@ -3441,7 +3479,7 @@ async def test_store_scope_selection_preserves_missing_telegram_filename_behavio
     )
 
     stored_clips = clip_store.store.await_args.args[0]
-    assert [clip.filename for clip in stored_clips] == ['telegram-77-1.mp4']
+    assert stored_clips == [b'one']
 
 
 @pytest.mark.asyncio
@@ -3582,11 +3620,13 @@ async def test_produce_scope_selection_becomes_stale_when_buffer_version_changes
 
 
 @pytest.mark.asyncio
-async def test_reconcile_scope_selection_uses_stored_filename_batches_without_downloading() -> None:
+async def test_reconcile_scope_selection_uses_stored_clip_id_batches_without_downloading() -> None:
     message = _fake_message(text='Select scope:', chat_id=77, message_id=53)
     callback = _fake_callback(message)
     state = _FakeState()
     await state.set_state(ReconcileClipFlow.scope)
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    clip_id_batches = [[_CLIP_ID_1], [_CLIP_ID_2, _CLIP_ID_3]]
     buffer = ChatMessageBuffer()
     buffer.append(
         _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
@@ -3614,8 +3654,8 @@ async def test_reconcile_scope_selection_uses_stored_filename_batches_without_do
         mode=FLOW_RECONCILE,
         menu_message_id=53,
         sub_season=SubSeason.NONE,
-        clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
-        filename_batches=[['one.mp4'], ['two.mp4', 'three.mp4']],
+        clip_group=clip_group,
+        clip_id_batches=clip_id_batches,
         buffer_version=buffer.version(77),
     )
 
@@ -3633,8 +3673,8 @@ async def test_reconcile_scope_selection_uses_stored_filename_batches_without_do
     )
 
     clip_store.reconcile.assert_awaited_once_with(
-        [['one.mp4'], ['two.mp4', 'three.mp4']],
-        group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+        clip_id_batches,
+        group=clip_group,
         sub_group=ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
     )
     bot.get_file.assert_not_awaited()
@@ -3660,7 +3700,18 @@ async def test_store_scope_selection_becomes_stale_when_buffer_version_changes()
 
     buffer = ChatMessageBuffer()
     buffer.append(
-        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            video=_fake_video(
+                file_id='f1',
+                file_name=_stored_filename(
+                    ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+                    ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
+                    _CLIP_ID_1,
+                ),
+            ),
+        ),
         chat_id=77,
     )
     await state.update_data(
@@ -3805,11 +3856,22 @@ async def test_reconcile_scope_selection_becomes_stale_when_buffer_version_chang
         menu_message_id=59,
         sub_season=SubSeason.NONE,
         clip_group=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
-        filename_batches=[['one.mp4']],
+        clip_id_batches=[[_CLIP_ID_1]],
         buffer_version=buffer.version(77),
     )
     buffer.append(
-        _fake_message(chat_id=77, message_id=2, video=_fake_video(file_id='f2', file_name='two.mp4')),
+        _fake_message(
+            chat_id=77,
+            message_id=2,
+            video=_fake_video(
+                file_id='f2',
+                file_name=_stored_filename(
+                    ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+                    ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
+                    _CLIP_ID_2,
+                ),
+            ),
+        ),
         chat_id=77,
     )
 
@@ -3836,17 +3898,18 @@ async def test_reconcile_entry_skips_text_only_buffered_groups() -> None:
     message = _fake_message(text='Got 1 clip', chat_id=77, message_id=55)
     callback = _fake_callback(message)
     state = _FakeState()
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
+    filename = _stored_filename(clip_group, clip_sub_group, _CLIP_ID_1)
 
     buffer = ChatMessageBuffer()
     buffer.append(_fake_message(chat_id=77, message_id=1, text='note'), chat_id=77)
     buffer.append(_fake_message(chat_id=77, message_id=2, text='ignored', media_group_id='g1'), chat_id=77)
     buffer.append(
-        _fake_message(chat_id=77, message_id=3, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        _fake_message(chat_id=77, message_id=3, video=_fake_video(file_id='f1', file_name=filename)),
         chat_id=77,
     )
-    clip_store = SimpleNamespace(
-        derive_group=AsyncMock(return_value=ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1))
-    )
+    clip_store = SimpleNamespace()
     services = _services(clip_store=clip_store, buffer=buffer)
 
     await on_intake_action(
@@ -3858,9 +3921,9 @@ async def test_reconcile_entry_skips_text_only_buffered_groups() -> None:
         state,
     )
 
-    clip_store.derive_group.assert_awaited_once_with([['one.mp4']])
     message.answer.assert_not_awaited()
-    assert state.data['filename_batches'] == [['one.mp4']]
+    assert state.data['clip_group'] == clip_group
+    assert state.data['clip_id_batches'] == [[_CLIP_ID_1]]
 
 
 @pytest.mark.asyncio
@@ -3873,13 +3936,19 @@ async def test_reconcile_entry_with_missing_video_filename_fails_cleanly_without
     state = _FakeState()
     await state.update_data(
         clip_group=ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-        filename_batches=[['old-one.mp4']],
+        clip_id_batches=[[_CLIP_ID_1]],
         buffer_version=0,
     )
+    clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
 
     buffer = ChatMessageBuffer()
     buffer.append(
-        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            video=_fake_video(file_id='f1', file_name=_stored_filename(clip_group, clip_sub_group, _CLIP_ID_1)),
+        ),
         chat_id=77,
     )
     buffer.append(
@@ -3887,7 +3956,7 @@ async def test_reconcile_entry_with_missing_video_filename_fails_cleanly_without
         chat_id=77,
     )
 
-    clip_store = SimpleNamespace(derive_group=AsyncMock())
+    clip_store = SimpleNamespace()
     services = _services(clip_store=clip_store, buffer=buffer)
 
     await on_intake_action(
@@ -3899,7 +3968,6 @@ async def test_reconcile_entry_with_missing_video_filename_fails_cleanly_without
         state,
     )
 
-    clip_store.derive_group.assert_not_awaited()
     message.answer.assert_not_awaited()
     message.edit_text.assert_awaited_once_with("Can't reconcile not stored", reply_markup=None)
     assert services.chat_message_buffer.peek(77) == []
@@ -3909,24 +3977,30 @@ async def test_reconcile_entry_with_missing_video_filename_fails_cleanly_without
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ('error', 'expected_message'),
+    ('file_name', 'expected_message'),
     [
-        (DuplicateFilenamesError(), "Can't reconcile duplicates"),
-        (InvalidFilenamesError(), "Can't reconcile not stored"),
-        (UnknownClipsError(clip_ids=['abc']), "Can't reconcile not stored"),
         (
-            MixedClipGroupsError(
-                groups=[
-                    ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
-                    ClipGroup(universe=Universe.EAST, year=2024, season=Season.S1),
-                ]
+            _stored_filename(
+                ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+                ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
+                _CLIP_ID_1,
+            ),
+            "Can't reconcile duplicates",
+        ),
+        ('not-a-valid-identity.mp4', "Can't reconcile not stored"),
+        (
+            _stored_filename(
+                ClipGroup(universe=Universe.EAST, year=2024, season=Season.S1),
+                ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
+                _CLIP_ID_1,
             ),
             "Can't reconcile mixed groups",
         ),
+        ('bad.identity', "Can't reconcile not stored"),
     ],
 )
-async def test_reconcile_entry_surfaces_derive_errors(
-    error: Exception,
+async def test_reconcile_entry_surfaces_parse_errors(
+    file_name: str,
     expected_message: str,
 ) -> None:
     message = _fake_message(text='Got 1 clip', chat_id=77, message_id=54)
@@ -3934,12 +4008,22 @@ async def test_reconcile_entry_surfaces_derive_errors(
     state = _FakeState()
 
     buffer = ChatMessageBuffer()
+    west_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    west_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
     buffer.append(
-        _fake_message(chat_id=77, message_id=1, video=_fake_video(file_id='f1', file_name='one.mp4')),
+        _fake_message(
+            chat_id=77,
+            message_id=1,
+            video=_fake_video(file_id='f1', file_name=_stored_filename(west_group, west_sub_group, _CLIP_ID_1)),
+        ),
+        chat_id=77,
+    )
+    buffer.append(
+        _fake_message(chat_id=77, message_id=2, video=_fake_video(file_id='f2', file_name=file_name)),
         chat_id=77,
     )
 
-    clip_store = SimpleNamespace(derive_group=AsyncMock(side_effect=error))
+    clip_store = SimpleNamespace()
     services = _services(clip_store=clip_store, buffer=buffer)
 
     await on_intake_action(
@@ -3961,32 +4045,42 @@ async def test_reconcile_entry_surfaces_derive_errors(
 @pytest.mark.asyncio
 async def test_send_stored_clip_batch_preserves_filename() -> None:
     bot = AsyncMock()
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
 
     await _send_stored_clip_batch(
         bot=bot,
         chat_id=5,
+        group=clip_group,
+        sub_group=clip_sub_group,
         clips=[
-            Clip(filename='clips/west-2025-1/a.mp4', bytes=b'a'),
-            Clip(filename='clips/west-2025-1/b.mp4', bytes=b'b'),
+            FetchedClip(id=_CLIP_ID_1, bytes=b'a'),
+            FetchedClip(id=_CLIP_ID_2, bytes=b'b'),
         ],
     )
 
     media = bot.send_media_group.await_args.kwargs['media']
-    assert media[0].media.filename == 'clips/west-2025-1/a.mp4'
-    assert media[1].media.filename == 'clips/west-2025-1/b.mp4'
+    assert media[0].media.filename == _stored_filename(clip_group, clip_sub_group, _CLIP_ID_1)
+    assert media[1].media.filename == _stored_filename(clip_group, clip_sub_group, _CLIP_ID_2)
 
 
 @pytest.mark.asyncio
 async def test_send_stored_clip_batch_sends_single_clip_as_video() -> None:
     bot = AsyncMock()
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
 
     await _send_stored_clip_batch(
         bot=bot,
         chat_id=5,
-        clips=[Clip(filename='clips/west-2025-1/a.mp4', bytes=b'a')],
+        group=clip_group,
+        sub_group=clip_sub_group,
+        clips=[FetchedClip(id=_CLIP_ID_1, bytes=b'a')],
     )
 
-    assert bot.send_video.await_args.kwargs['video'].filename == 'clips/west-2025-1/a.mp4'
+    assert bot.send_video.await_args.kwargs['video'].filename == _stored_filename(
+        clip_group, clip_sub_group, _CLIP_ID_1
+    )
     bot.send_media_group.assert_not_awaited()
 
 
@@ -3996,8 +4090,8 @@ async def test_send_retrieve_scopes_sends_separator_only_between_scope_blocks_an
     services = _services(
         clip_store=_RetrieveClipStore(
             {
-                Scope.COLLECTION: [[Clip(filename='one.mp4', bytes=b'1')]],
-                Scope.EXTRA: [[Clip(filename='two.mp4', bytes=b'2')]],
+                Scope.COLLECTION: [[FetchedClip(id=_CLIP_ID_1, bytes=b'1')]],
+                Scope.EXTRA: [[FetchedClip(id=_CLIP_ID_2, bytes=b'2')]],
             }
         )
     )
@@ -4028,9 +4122,29 @@ async def test_send_retrieve_scopes_sends_separator_only_between_scope_blocks_an
         ),
     ]
     assert bot.events == [
-        ('video', (9, 'one.mp4')),
+        (
+            'video',
+            (
+                9,
+                _stored_filename(
+                    ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+                    ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
+                    _CLIP_ID_1,
+                ),
+            ),
+        ),
         ('message', (9, '.')),
-        ('video', (9, 'two.mp4')),
+        (
+            'video',
+            (
+                9,
+                _stored_filename(
+                    ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
+                    ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
+                    _CLIP_ID_2,
+                ),
+            ),
+        ),
         ('message', (9, 'Done')),
     ]
 
@@ -4038,13 +4152,15 @@ async def test_send_retrieve_scopes_sends_separator_only_between_scope_blocks_an
 @pytest.mark.asyncio
 async def test_send_retrieve_scopes_requests_normalized_fetch_and_sends_results() -> None:
     bot = AsyncMock()
+    clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
     clip_store = _RetrieveClipStore(
         {
             Scope.COLLECTION: [
-                [Clip(filename='one.mp4', bytes=b'one')],
+                [FetchedClip(id=_CLIP_ID_1, bytes=b'one')],
                 [
-                    Clip(filename='two.mp4', bytes=b'two'),
-                    Clip(filename='three.mp4', bytes=b'three'),
+                    FetchedClip(id=_CLIP_ID_2, bytes=b'two'),
+                    FetchedClip(id=_CLIP_ID_3, bytes=b'three'),
                 ],
             ]
         }
@@ -4064,22 +4180,27 @@ async def test_send_retrieve_scopes_requests_normalized_fetch_and_sends_results(
 
     assert clip_store.calls == [
         (
-            ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1),
-            ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION),
+            clip_group,
+            clip_sub_group,
             None,
             AudioNormalization(loudness=-13, bitrate=160),
         )
     ]
-    assert bot.send_video.await_args.kwargs['video'].filename == 'one.mp4'
+    assert bot.send_video.await_args.kwargs['video'].filename == _stored_filename(
+        clip_group, clip_sub_group, _CLIP_ID_1
+    )
     assert bot.send_video.await_args.kwargs['video'].data == b'normalized:one'
     sent_media = bot.send_media_group.await_args.kwargs['media']
-    assert [item.media.filename for item in sent_media] == ['two.mp4', 'three.mp4']
+    assert [item.media.filename for item in sent_media] == [
+        _stored_filename(clip_group, clip_sub_group, _CLIP_ID_2),
+        _stored_filename(clip_group, clip_sub_group, _CLIP_ID_3),
+    ]
     assert [item.media.data for item in sent_media] == [b'normalized:two', b'normalized:three']
     assert clip_store.batches_by_scope[Scope.COLLECTION] == [
-        [Clip(filename='one.mp4', bytes=b'one')],
+        [FetchedClip(id=_CLIP_ID_1, bytes=b'one')],
         [
-            Clip(filename='two.mp4', bytes=b'two'),
-            Clip(filename='three.mp4', bytes=b'three'),
+            FetchedClip(id=_CLIP_ID_2, bytes=b'two'),
+            FetchedClip(id=_CLIP_ID_3, bytes=b'three'),
         ],
     ]
 
@@ -4091,7 +4212,7 @@ async def test_send_retrieve_scopes_sends_raw_batches_when_normalization_is_disa
         clip_store=_RetrieveClipStore(
             {
                 Scope.COLLECTION: [
-                    [Clip(filename='one.mp4', bytes=b'one')],
+                    [FetchedClip(id=_CLIP_ID_1, bytes=b'one')],
                 ]
             }
         )

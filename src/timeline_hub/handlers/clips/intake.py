@@ -62,12 +62,11 @@ from timeline_hub.handlers.clips.retrieve import (
 )
 from timeline_hub.services.clip_store import (
     AudioNormalization,
-    Clip,
     ClipGroup,
+    ClipId,
+    ClipStore,
     ClipSubGroup,
-    DuplicateFilenamesError,
-    InvalidFilenamesError,
-    MixedClipGroupsError,
+    DuplicateClipIdsError,
     ReconcileResult,
     Scope,
     Season,
@@ -90,6 +89,8 @@ _PRODUCE_FLOW_MODE = 'produce'
 _REORDER_MAX_CLIPS = 16
 _REORDER_SELECTION_PROMPT = 'Select new order:'
 _REORDER_RESET_CALLBACK_VALUE = 'reset'
+_MIXED_GROUPS = 'mixed_groups'
+_INVALID_IDENTITY = 'invalid_identity'
 type IntakeShowMenu = Callable[..., Awaitable[bool]]
 
 
@@ -280,22 +281,11 @@ async def on_intake_action(
                 chat_id=message.chat.id,
             ):
                 try:
-                    filename_batches = _pending_reconcile_filename_batches(
+                    clip_group, clip_id_batches = _pending_reconcile_clip_id_batches(
                         services=services,
                         chat_id=message.chat.id,
                     )
-                except ValueError:
-                    await _invalidate_intake_buffer(
-                        message=message,
-                        state=state,
-                        services=services,
-                        text="Can't reconcile not stored",
-                    )
-                    return
-
-                try:
-                    clip_group = await services.clip_store.derive_group(filename_batches)
-                except DuplicateFilenamesError:
+                except DuplicateClipIdsError:
                     await _invalidate_intake_buffer(
                         message=message,
                         state=state,
@@ -303,20 +293,15 @@ async def on_intake_action(
                         text="Can't reconcile duplicates",
                     )
                     return
-                except InvalidFilenamesError, UnknownClipsError:
-                    await _invalidate_intake_buffer(
-                        message=message,
-                        state=state,
-                        services=services,
-                        text="Can't reconcile not stored",
+                except ValueError as error:
+                    text = (
+                        "Can't reconcile mixed groups" if str(error) == _MIXED_GROUPS else "Can't reconcile not stored"
                     )
-                    return
-                except MixedClipGroupsError:
                     await _invalidate_intake_buffer(
                         message=message,
                         state=state,
                         services=services,
-                        text="Can't reconcile mixed groups",
+                        text=text,
                     )
                     return
 
@@ -326,21 +311,21 @@ async def on_intake_action(
                     state=state,
                     settings=settings,
                     clip_group=clip_group,
-                    filename_batches=filename_batches,
+                    clip_id_batches=clip_id_batches,
                     buffer_version=buffer_version,
                 )
                 return
 
             stored_data = await state.get_data()
             stored_clip_group = _reconcile_clip_group_from_state(stored_data)
-            stored_filename_batches = _reconcile_filename_batches_from_state(stored_data)
-            if stored_clip_group is not None and stored_filename_batches is not None:
+            stored_clip_id_batches = _reconcile_clip_id_batches_from_state(stored_data)
+            if stored_clip_group is not None and stored_clip_id_batches is not None:
                 await _show_reconcile_sub_season_menu(
                     message=message,
                     state=state,
                     settings=settings,
                     clip_group=stored_clip_group,
-                    filename_batches=stored_filename_batches,
+                    clip_id_batches=stored_clip_id_batches,
                 )
                 return
 
@@ -618,8 +603,8 @@ async def _on_store_back(
     if flow is _RECONCILE_FLOW:
         match step:
             case MenuStep.SUB_SEASON:
-                filename_batches = _reconcile_filename_batches_from_state(data)
-                if filename_batches is None:
+                clip_id_batches = _reconcile_clip_id_batches_from_state(data)
+                if clip_id_batches is None:
                     await handle_stale_selection(message=message, state=state)
                     return
                 await _show_intake_action_menu(
@@ -627,14 +612,14 @@ async def _on_store_back(
                     state=state,
                     services=services,
                     settings=settings,
-                    clip_count_override=_filename_batch_clip_count(filename_batches),
+                    clip_count_override=_clip_id_batch_count(clip_id_batches),
                     preserve_state=True,
                 )
 
             case MenuStep.SCOPE:
                 clip_group = _reconcile_clip_group_from_state(data)
-                filename_batches = _reconcile_filename_batches_from_state(data)
-                if clip_group is None or filename_batches is None:
+                clip_id_batches = _reconcile_clip_id_batches_from_state(data)
+                if clip_group is None or clip_id_batches is None:
                     await handle_stale_selection(message=message, state=state)
                     return
                 await _show_reconcile_sub_season_menu(
@@ -642,7 +627,7 @@ async def _on_store_back(
                     state=state,
                     settings=settings,
                     clip_group=clip_group,
-                    filename_batches=filename_batches,
+                    clip_id_batches=clip_id_batches,
                 )
         return
 
@@ -859,6 +844,8 @@ async def _on_store_select(
                     await _send_fetched_clip_batches(
                         bot=bot,
                         chat_id=message.chat.id,
+                        group=clip_group,
+                        sub_group=clip_sub_group,
                         clip_batches=services.clip_store.fetch(
                             clip_group,
                             clip_sub_group,
@@ -887,8 +874,8 @@ async def _on_reconcile_select(
 ) -> None:
     data = await state.get_data()
     clip_group = _reconcile_clip_group_from_state(data)
-    filename_batches = _reconcile_filename_batches_from_state(data)
-    if clip_group is None or filename_batches is None:
+    clip_id_batches = _reconcile_clip_id_batches_from_state(data)
+    if clip_group is None or clip_id_batches is None:
         await handle_stale_selection(message=message, state=state)
         return
 
@@ -904,7 +891,7 @@ async def _on_reconcile_select(
                 settings=settings,
                 clip_group=clip_group,
                 sub_season=sub_season,
-                filename_batches=filename_batches,
+                clip_id_batches=clip_id_batches,
             )
 
         case MenuStep.SCOPE:
@@ -931,11 +918,18 @@ async def _on_reconcile_select(
             services.chat_message_buffer.flush(message.chat.id)
             await state.clear()
 
-            result = await services.clip_store.reconcile(
-                filename_batches,
-                group=clip_group,
-                sub_group=clip_sub_group,
-            )
+            try:
+                result = await services.clip_store.reconcile(
+                    clip_id_batches,
+                    group=clip_group,
+                    sub_group=clip_sub_group,
+                )
+            except DuplicateClipIdsError:
+                await message.answer(text="Can't reconcile duplicates")
+                return
+            except UnknownClipsError:
+                await message.answer(text="Can't reconcile not stored")
+                return
             await message.answer(**_reconcile_summary_kwargs(result))
 
         case _:
@@ -1085,7 +1079,7 @@ async def _show_reconcile_sub_season_menu(
     state: FSMContext,
     settings: Settings,
     clip_group: ClipGroup,
-    filename_batches: list[list[str]],
+    clip_id_batches: list[list[ClipId]],
     buffer_version: int | None = None,
 ) -> None:
     if not await _show_intake_menu_or_stale(
@@ -1100,7 +1094,7 @@ async def _show_reconcile_sub_season_menu(
         return
     await state.update_data(
         clip_group=clip_group,
-        filename_batches=filename_batches,
+        clip_id_batches=clip_id_batches,
     )
 
 
@@ -1111,7 +1105,7 @@ async def _show_reconcile_scope_menu(
     settings: Settings,
     clip_group: ClipGroup,
     sub_season: SubSeason,
-    filename_batches: list[list[str]],
+    clip_id_batches: list[list[ClipId]],
 ) -> None:
     if not await _show_intake_menu_or_stale(
         show_menu=_show_store_scope_menu,
@@ -1125,7 +1119,7 @@ async def _show_reconcile_scope_menu(
         return
     await state.update_data(
         clip_group=clip_group,
-        filename_batches=filename_batches,
+        clip_id_batches=clip_id_batches,
     )
 
 
@@ -1141,11 +1135,11 @@ async def _store_buffered_clips(
     message_groups = services.chat_message_buffer.flush_grouped(chat_id)
 
     for message_group in message_groups:
-        clips = await _message_group_to_clips(bot=bot, message_group=message_group)
-        if not clips:
+        clip_bytes_batch = await _message_group_to_clip_bytes(bot=bot, message_group=message_group)
+        if not clip_bytes_batch:
             continue
         result += await services.clip_store.store(
-            clips,
+            clip_bytes_batch,
             group=clip_group,
             sub_group=clip_sub_group,
         )
@@ -1240,7 +1234,7 @@ async def _store_route_batches(
         stored_any = False
         for start in range(0, len(route_batch.messages), _ROUTE_STORE_CHUNK_SIZE):
             batch_result = await services.clip_store.store(
-                await _video_messages_to_clips(
+                await _video_messages_to_clip_bytes(
                     bot=bot,
                     messages=route_batch.messages[start : start + _ROUTE_STORE_CHUNK_SIZE],
                 ),
@@ -1265,44 +1259,36 @@ async def _store_route_batches(
     )
 
 
-async def _message_group_to_clips(
+async def _message_group_to_clip_bytes(
     *,
     bot: Bot,
     message_group: MessageGroup,
-) -> list[Clip]:
-    clips: list[Clip] = []
+) -> list[bytes]:
+    clips: list[bytes] = []
 
     for message in message_group:
         if message.video is None:
             continue
-        clips.append(
-            Clip(
-                filename=_telegram_clip_filename(message),
-                bytes=await download_video_bytes(bot, file_id=message.video.file_id),
-            )
-        )
+        clips.append(await download_video_bytes(bot, file_id=message.video.file_id))
 
     return clips
 
 
-async def _video_messages_to_clips(
+async def _video_messages_to_clip_bytes(
     *,
     bot: Bot,
     messages: Sequence[Message],
-) -> list[Clip]:
-    async def to_clip(message: Message) -> Clip:
+) -> list[bytes]:
+    async def to_clip_bytes(message: Message) -> bytes:
         if message.video is None:
             raise ValueError('Route batches must contain only video messages')
-        return Clip(
-            filename=_telegram_clip_filename(message),
-            bytes=await download_video_bytes(bot, file_id=message.video.file_id),
-        )
+        return await download_video_bytes(bot, file_id=message.video.file_id)
 
     # Route storage slices large route groups before calling this helper,
     # so downloads remain concurrent while each store() call stays bounded.
     # `gather()` preserves input order, which keeps the stored clip order aligned
     # with the original buffered message order.
-    return list(await asyncio.gather(*(to_clip(message) for message in messages)))
+    return list(await asyncio.gather(*(to_clip_bytes(message) for message in messages)))
 
 
 def _message_group_to_filenames(message_group: MessageGroup) -> list[str]:
@@ -1320,12 +1306,14 @@ def _message_groups_to_filenames(message_groups: list[MessageGroup]) -> list[lis
     return [filenames for message_group in message_groups if (filenames := _message_group_to_filenames(message_group))]
 
 
-def _pending_reconcile_filename_batches(
+def _pending_reconcile_clip_id_batches(
     *,
     services: Services,
     chat_id: ChatId,
-) -> list[list[str]]:
-    return _message_groups_to_filenames(services.chat_message_buffer.peek_grouped(chat_id))
+) -> tuple[ClipGroup, list[list[ClipId]]]:
+    return _parse_reconcile_filename_batches(
+        _message_groups_to_filenames(services.chat_message_buffer.peek_grouped(chat_id))
+    )
 
 
 def _has_pending_reconcile_videos(
@@ -1369,12 +1357,6 @@ def parse_route_text(text: str) -> ClipGroup | None:
         return None
 
     return ClipGroup(universe=universe, year=2000 + int(year_suffix), season=season)
-
-
-def _telegram_clip_filename(message: Message) -> str:
-    if message.video is not None and message.video.file_name:
-        return message.video.file_name
-    return f'telegram-{message.chat.id}-{message.message_id}.mp4'
 
 
 def _buffered_video_messages(message_groups: Sequence[MessageGroup]) -> list[Message]:
@@ -1856,24 +1838,52 @@ def _reconcile_clip_group_from_state(data: dict[str, object]) -> ClipGroup | Non
     return None
 
 
-def _reconcile_filename_batches_from_state(data: dict[str, object]) -> list[list[str]] | None:
-    filename_batches = data.get('filename_batches')
-    if not isinstance(filename_batches, list):
+def _reconcile_clip_id_batches_from_state(data: dict[str, object]) -> list[list[ClipId]] | None:
+    clip_id_batches = data.get('clip_id_batches')
+    if not isinstance(clip_id_batches, list):
         return None
 
-    normalized_batches: list[list[str]] = []
-    for batch in filename_batches:
+    normalized_batches: list[list[ClipId]] = []
+    for batch in clip_id_batches:
         if not isinstance(batch, list):
             return None
-        normalized_batch: list[str] = []
-        for filename in batch:
-            if not isinstance(filename, str):
+        normalized_batch: list[ClipId] = []
+        for clip_id in batch:
+            if not isinstance(clip_id, str):
                 return None
-            normalized_batch.append(filename)
+            normalized_batch.append(clip_id)
         normalized_batches.append(normalized_batch)
 
     return normalized_batches
 
 
-def _filename_batch_clip_count(filename_batches: list[list[str]]) -> int:
-    return sum(len(batch) for batch in filename_batches)
+def _clip_id_batch_count(clip_id_batches: list[list[ClipId]]) -> int:
+    return sum(len(batch) for batch in clip_id_batches)
+
+
+def _parse_reconcile_filename_batches(
+    filename_batches: list[list[str]],
+) -> tuple[ClipGroup, list[list[ClipId]]]:
+    clip_group: ClipGroup | None = None
+    clip_id_batches: list[list[ClipId]] = []
+    flat_clip_ids: list[ClipId] = []
+
+    for batch in filename_batches:
+        clip_id_batch: list[ClipId] = []
+        for filename in batch:
+            identity_str = filename.rsplit('.', 1)[0] if '.' in filename else filename
+            parsed_group, _parsed_sub_group, clip_id = ClipStore.string_to_clip_identity(identity_str)
+            if clip_group is None:
+                clip_group = parsed_group
+            elif parsed_group != clip_group:
+                raise ValueError(_MIXED_GROUPS)
+            clip_id_batch.append(clip_id)
+            flat_clip_ids.append(clip_id)
+        if clip_id_batch:
+            clip_id_batches.append(clip_id_batch)
+
+    if clip_group is None or not clip_id_batches:
+        raise ValueError(_INVALID_IDENTITY)
+    if len(set(flat_clip_ids)) != len(flat_clip_ids):
+        raise DuplicateClipIdsError(clip_ids=flat_clip_ids)
+    return clip_group, clip_id_batches

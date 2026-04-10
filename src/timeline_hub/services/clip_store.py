@@ -16,11 +16,8 @@ _CLIPS_PREFIX = 'clips'
 _MANIFEST_FILENAME = 'manifest.json'
 _VIDEO_SUFFIX = '.mp4'
 _CLIP_GROUP_SEPARATOR = '-'
-# S3 keys often use '/' as delimiter, which is not safe for Telegram/local filenames.
-# This token replaces '/' when converting storage keys to portable filenames.
-_FILENAME_S3_DELIMITER_ESCAPE = '--'
 
-type Filename = str
+type ClipBytes = bytes
 type ClipId = str
 
 
@@ -108,15 +105,10 @@ class ClipSubGroup:
 
 
 @dataclass(frozen=True, slots=True)
-class Clip:
-    """Clip payload plus portable filename.
+class FetchedClip:
+    """Fetched clip payload identified only by clip id."""
 
-    Stored clips may originate from an S3 key, which cannot be used directly
-    as a filename because path separators like `/` are not portable across
-    Telegram and local filesystems.
-    """
-
-    filename: str
+    id: ClipId
     bytes: bytes
 
 
@@ -342,22 +334,6 @@ class ReconcileResult:
     removed: int
 
 
-class DuplicateFilenamesError(ValueError):
-    """Raised when `reconcile()` receives duplicate filenames."""
-
-
-class InvalidFilenamesError(ValueError):
-    """Raised when `reconcile()` receives filenames that are not stored in the clip group."""
-
-
-class MixedClipGroupsError(ValueError):
-    """Raised when reconcile filenames span more than one clip group."""
-
-    def __init__(self, *, groups: Sequence[ClipGroup]) -> None:
-        self.groups = tuple(groups)
-        super().__init__(f'Filenames span multiple clip groups: {list(self.groups)}')
-
-
 class UnknownClipsError(ValueError):
     """Raised when reconcile filenames refer to clip ids missing from the manifest."""
 
@@ -367,7 +343,7 @@ class UnknownClipsError(ValueError):
 
 
 class DuplicateClipIdsError(ValueError):
-    """Raised when `fetch()` receives duplicate clip ids."""
+    """Raised when clip-id inputs contain duplicates."""
 
     def __init__(self, *, clip_ids: Sequence[ClipId]) -> None:
         self.clip_ids = tuple(clip_ids)
@@ -544,7 +520,7 @@ class ClipStore:
 
     async def store(
         self,
-        clips: Sequence[Clip],
+        clips: Sequence[ClipBytes],
         *,
         group: ClipGroup,
         sub_group: ClipSubGroup,
@@ -584,22 +560,16 @@ class ClipStore:
         seen_hashes: set[str] = set()
         seen_ids: set[ClipId] = set()
         duplicate_count = 0
-        accepted_clips: list[tuple[ClipId, str, Clip]] = []
+        accepted_clips: list[tuple[ClipId, str, ClipBytes]] = []
         uploaded_keys: list[Key] = []
-        for clip in clips:
-            stored_clip_id = self._parse_stored_clip_id(clip.filename)
-            video_hash = await hash_video_content(clip.bytes)
-
-            if stored_clip_id is not None and (manifest.has_id(stored_clip_id) or stored_clip_id in seen_ids):
-                duplicate_count += 1
-                continue
-
+        for clip_bytes in clips:
+            video_hash = await hash_video_content(clip_bytes)
             if manifest.has_video_hash(video_hash) or video_hash in seen_hashes:
                 duplicate_count += 1
                 continue
 
             clip_id = self._new_clip_id(manifest=manifest, seen_ids=seen_ids)
-            accepted_clips.append((clip_id, video_hash, clip))
+            accepted_clips.append((clip_id, video_hash, clip_bytes))
             seen_ids.add(clip_id)
             seen_hashes.add(video_hash)
 
@@ -610,8 +580,8 @@ class ClipStore:
             sub_season=sub_group.sub_season,
             scope=sub_group.scope,
         )
-        new_entries: list[tuple[ManifestEntry, Clip]] = []
-        for order, (clip_id, video_hash, clip) in enumerate(accepted_clips, start=1):
+        new_entries: list[tuple[ManifestEntry, ClipBytes]] = []
+        for order, (clip_id, video_hash, clip_bytes) in enumerate(accepted_clips, start=1):
             entry = ManifestEntry(
                 id=clip_id,
                 video_hash=video_hash,
@@ -622,16 +592,16 @@ class ClipStore:
                 order=order,
             )
             manifest.append(entry)
-            new_entries.append((entry, clip))
+            new_entries.append((entry, clip_bytes))
 
         manifest_key = self._manifest_key(clip_group_prefix)
 
-        for entry, clip in new_entries:
+        for entry, clip_bytes in new_entries:
             clip_key = self._clip_key(clip_group_prefix, entry.id)
             try:
                 await self._s3_client.put_bytes(
                     clip_key,
-                    clip.bytes,
+                    clip_bytes,
                     content_type=S3ContentType.MP4,
                 )
             except Exception as error:
@@ -675,7 +645,7 @@ class ClipStore:
         *,
         clip_ids: Sequence[ClipId] | None = None,
         audio_normalization: AudioNormalization | None = None,
-    ) -> AsyncIterator[list[Clip]]:
+    ) -> AsyncIterator[list[FetchedClip]]:
         """Fetch clips for a clip sub-group in preserved batch order.
 
         The iterator yields one list per stored batch. Batches are ordered by
@@ -751,11 +721,11 @@ class ClipStore:
         for _, batch_entries in itertools.groupby(matching_entries, key=lambda entry: entry.batch):
             batch_entries_list = list(batch_entries)
             if audio_normalization is None:
-                clip_batch: list[Clip] = []
+                clip_batch: list[FetchedClip] = []
                 for entry in batch_entries_list:
                     clip_key = self._clip_key(clip_group_prefix, entry.id)
                     clip_bytes = await self._s3_client.get_bytes(clip_key)
-                    clip_batch.append(Clip(filename=self._s3_key_to_filename(clip_key), bytes=clip_bytes))
+                    clip_batch.append(FetchedClip(id=entry.id, bytes=clip_bytes))
                 yield clip_batch
                 continue
 
@@ -769,15 +739,15 @@ class ClipStore:
 
     async def reconcile(
         self,
-        filename_batches: Sequence[Sequence[Filename]],
+        clip_id_batches: Sequence[Sequence[ClipId]],
         *,
         group: ClipGroup,
         sub_group: ClipSubGroup,
     ) -> ReconcileResult:
-        """Replace one sub-group with the provided filename-derived manifest state.
+        """Replace one sub-group with the provided clip-id manifest state.
 
         Reconcile is manifest-authoritative for the target `ClipSubGroup`.
-        The provided `filename_batches` define the complete desired subgroup
+        The provided `clip_id_batches` define the complete desired subgroup
         state: their order becomes canonical, omitted clips are removed from
         that subgroup, and clips may be moved in from other sub-groups within
         the same `ClipGroup`. The operation never hashes, uploads, downloads,
@@ -787,43 +757,22 @@ class ClipStore:
         The manifest remains authoritative for normalized-cache tracking.
         Untracked normalized objects are treated as stale cache, not storage state.
 
-        Precondition:
-            `filename_batches` must refer to clips belonging to the provided
-            `clip_group`. Callers are expected to validate and derive the
-            common group first via `derive_group()`.
-
         Raises:
-            ValueError: If `filename_batches` is empty or all batches are empty.
-            DuplicateFilenamesError: If the provided filenames contain duplicates.
-            InvalidFilenamesError: If any filename is malformed or not a stored-style clip filename.
+            ValueError: If `clip_id_batches` is empty or all batches are empty.
+            DuplicateClipIdsError: If the provided clip ids contain duplicates.
             UnknownClipsError: If a parsed clip id is not present in the provided clip group's manifest.
             ClipGroupNotFoundError: If the requested clip group has no manifest.
             ManifestCorruptedError: If the clip-group manifest exists but is malformed.
             ReconcileDeleteError: If one or more removed clip objects cannot be deleted after the manifest rewrite.
         """
-        if not filename_batches or all(not batch for batch in filename_batches):
-            raise ValueError('`filename_batches` must contain at least one filename')
-
-        flat_filenames = [filename for batch in filename_batches for filename in batch]
-        if len(set(flat_filenames)) != len(flat_filenames):
-            raise DuplicateFilenamesError('`filename_batches` must not contain duplicate filenames')
-
-        clip_id_batches: list[list[ClipId]] = []
-        for batch in filename_batches:
-            clip_id_batch: list[ClipId] = []
-            for filename in batch:
-                parsed_identity = self._parse_filename_identity(filename)
-                if parsed_identity is None:
-                    raise InvalidFilenamesError(f'Filename is not a stored clip: {filename}')
-                parsed_group, clip_id = parsed_identity
-                if parsed_group != group:
-                    raise ValueError('`filename_batches` must belong to the provided `clip_group`')
-                clip_id_batch.append(clip_id)
-            clip_id_batches.append(clip_id_batch)
+        if not clip_id_batches or all(not batch for batch in clip_id_batches):
+            raise ValueError('`clip_id_batches` must contain at least one clip id')
 
         clip_ids = [clip_id for batch in clip_id_batches for clip_id in batch]
         if not clip_ids:
-            raise ValueError('`filename_batches` must contain at least one filename')
+            raise ValueError('`clip_id_batches` must contain at least one clip id')
+        if len(set(clip_ids)) != len(clip_ids):
+            raise DuplicateClipIdsError(clip_ids=clip_ids)
 
         clip_group_prefix = self._clip_group_prefix(
             universe=group.universe,
@@ -1000,63 +949,6 @@ class ClipStore:
             manifest=rewritten_manifest,
         )
 
-    async def derive_group(
-        self,
-        filename_batches: Sequence[Sequence[Filename]],
-    ) -> ClipGroup:
-        """Validate reconcile filenames and derive their single common clip group.
-
-        Raises:
-            ValueError: If `filename_batches` is empty or all batches are empty.
-            DuplicateFilenamesError: If the provided filenames contain duplicates.
-            InvalidFilenamesError: If any filename is malformed or not a stored-style clip filename.
-            MixedClipGroupsError: If filenames refer to more than one clip group.
-            UnknownClipsError: If clip ids are missing from the derived group's manifest.
-            ManifestCorruptedError: If the derived clip-group manifest exists but is malformed.
-        """
-        if not filename_batches or all(not batch for batch in filename_batches):
-            raise ValueError('`filename_batches` must contain at least one filename')
-
-        flat_filenames = [filename for batch in filename_batches for filename in batch]
-        if len(set(flat_filenames)) != len(flat_filenames):
-            raise DuplicateFilenamesError('`filename_batches` must not contain duplicate filenames')
-
-        parsed_identities: list[tuple[ClipGroup, str]] = []
-        parsed_groups: set[ClipGroup] = set()
-        for filename in flat_filenames:
-            parsed_identity = self._parse_filename_identity(filename)
-            if parsed_identity is None:
-                raise InvalidFilenamesError(f'Filename is not a stored clip: {filename}')
-            clip_group, clip_id = parsed_identity
-            parsed_identities.append((clip_group, clip_id))
-            parsed_groups.add(clip_group)
-
-        if len(parsed_groups) != 1:
-            raise MixedClipGroupsError(
-                groups=sorted(
-                    parsed_groups,
-                    key=lambda group: (group.universe.order(), group.year, int(group.season)),
-                )
-            )
-
-        clip_group = next(iter(parsed_groups))
-        clip_group_prefix = self._clip_group_prefix(
-            universe=clip_group.universe,
-            year=clip_group.year,
-            season=clip_group.season,
-        )
-        try:
-            manifest = await self._load_manifest_for_read(clip_group_prefix)
-        except S3ObjectNotFoundError as error:
-            raise UnknownClipsError(clip_ids=[clip_id for _, clip_id in parsed_identities]) from error
-
-        known_ids = {entry.id for entry in manifest}
-        unknown_ids = [clip_id for _, clip_id in parsed_identities if clip_id not in known_ids]
-        if unknown_ids:
-            raise UnknownClipsError(clip_ids=unknown_ids)
-
-        return clip_group
-
     @staticmethod
     def clip_identity_to_string(
         group: ClipGroup,
@@ -1200,29 +1092,6 @@ class ClipStore:
             if not manifest.has_id(clip_id) and clip_id not in seen_ids:
                 return clip_id
 
-    def _parse_stored_clip_id(self, filename: str) -> ClipId | None:
-        parsed_identity = self._parse_filename_identity(filename)
-        if parsed_identity is None:
-            return None
-        _, clip_id = parsed_identity
-        return clip_id
-
-    def _parse_filename_identity(self, filename: Filename) -> tuple[ClipGroup, ClipId] | None:
-        parts = S3Client.split(self._filename_to_s3_key(filename))
-        if len(parts) != 3:
-            return None
-
-        top_level_prefix, clip_group, object_name = parts
-        if top_level_prefix != _CLIPS_PREFIX or not object_name.endswith(_VIDEO_SUFFIX):
-            return None
-
-        try:
-            parsed_clip_group = self._parse_clip_group_prefix(S3Client.join(top_level_prefix, clip_group))
-            clip_id = _parse_uuid7(object_name.removesuffix(_VIDEO_SUFFIX), field='id')
-        except ValueError:
-            return None
-        return parsed_clip_group, clip_id
-
     async def _load_manifest_for_store(self, clip_group_prefix: Prefix) -> Manifest:
         if (cached_manifest := self._manifest_cache.get(clip_group_prefix)) is not None:
             return cached_manifest.copy()
@@ -1275,15 +1144,14 @@ class ClipStore:
         batch_entries: Sequence[ManifestEntry],
         *,
         audio_normalization: AudioNormalization,
-    ) -> tuple[list[Clip], Manifest]:
-        clip_batch: list[Clip | None] = [None] * len(batch_entries)
+    ) -> tuple[list[FetchedClip], Manifest]:
+        clip_batch: list[FetchedClip | None] = [None] * len(batch_entries)
         rewritten_entries: dict[ClipId, ManifestEntry] = {}
         uploaded_keys: list[Key] = []
         affected_clip_ids: list[ClipId] = []
 
         try:
             for index, entry in enumerate(batch_entries):
-                filename = self._s3_key_to_filename(self._clip_key(clip_group_prefix, entry.id))
                 normalized_key = self._normalized_clip_key(clip_group_prefix, entry.id)
 
                 if entry.audio_normalization == audio_normalization:
@@ -1307,7 +1175,7 @@ class ClipStore:
                             batch=entry.batch,
                             order=entry.order,
                         )
-                    clip_batch[index] = Clip(filename=filename, bytes=normalized_bytes)
+                    clip_batch[index] = FetchedClip(id=entry.id, bytes=normalized_bytes)
                     continue
 
                 normalized_bytes = await self._regenerate_normalized_twin(
@@ -1327,7 +1195,7 @@ class ClipStore:
                     batch=entry.batch,
                     order=entry.order,
                 )
-                clip_batch[index] = Clip(filename=filename, bytes=normalized_bytes)
+                clip_batch[index] = FetchedClip(id=entry.id, bytes=normalized_bytes)
         except Exception as error:
             if uploaded_keys:
                 sync_error = NormalizedClipManifestSyncError(
@@ -1381,14 +1249,6 @@ class ClipStore:
             content_type=S3ContentType.MP4,
         )
         return normalized_bytes
-
-    @staticmethod
-    def _s3_key_to_filename(storage_key: Key) -> str:
-        return _FILENAME_S3_DELIMITER_ESCAPE.join(S3Client.split(storage_key))
-
-    @staticmethod
-    def _filename_to_s3_key(filename: str) -> Key:
-        return S3Client.join(*filename.split(_FILENAME_S3_DELIMITER_ESCAPE))
 
 
 def _uuid7() -> uuid.UUID:
