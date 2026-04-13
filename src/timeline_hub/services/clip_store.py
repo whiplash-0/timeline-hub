@@ -4,6 +4,7 @@ import math
 import uuid
 from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from enum import IntEnum, StrEnum
 from typing import Any, Self, TypeVar
 
@@ -461,6 +462,28 @@ class NormalizedClipManifestSyncError(RuntimeError):
             'Normalized clip/manifest synchronization failed '
             f'at stage={self.stage} for clip ids {list(self.affected_clip_ids)} '
             f'after writing normalized keys {list(self.written_keys)}'
+        )
+
+
+class ClipRemoveManifestSyncError(RuntimeError):
+    """Raised when staged clip removals are not synchronized back into manifest state."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        clip_ids: Sequence[ClipId],
+        touched_keys: Sequence[Key],
+        manifest_key: Key,
+    ) -> None:
+        self.stage = stage
+        self.clip_ids = tuple(clip_ids)
+        self.touched_keys = tuple(touched_keys)
+        self.manifest_key = manifest_key
+        super().__init__(
+            f'Staged clip remove failed at {self.stage} for clip ids {list(self.clip_ids)}; '
+            f'touched keys: {list(self.touched_keys)}; '
+            f'manifest key not synchronized: {self.manifest_key}'
         )
 
 
@@ -1005,6 +1028,268 @@ class ClipStore:
             manifest=rewritten_manifest,
         )
 
+    async def reorder(
+        self,
+        group: ClipGroup,
+        sub_group: ClipSubGroup,
+        *,
+        clip_id_batches: Sequence[Sequence[ClipId]],
+    ) -> None:
+        """Rewrite the authoritative batch layout for exactly one existing sub-group."""
+        clip_ids = self._flatten_clip_id_batches(
+            clip_id_batches,
+            operation='reorder()',
+        )
+        if len(set(clip_ids)) != len(clip_ids):
+            raise DuplicateClipIdsError(clip_ids=clip_ids)
+
+        clip_group_prefix = self._clip_group_prefix(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+        )
+        try:
+            manifest = await self._load_manifest_for_read(clip_group_prefix)
+        except S3ObjectNotFoundError as error:
+            raise ClipGroupNotFoundError(
+                universe=group.universe,
+                year=group.year,
+                season=group.season,
+                sub_season=None,
+                scope=None,
+            ) from error
+
+        entries_by_id = {entry.id: entry for entry in manifest}
+        unknown_ids = [clip_id for clip_id in clip_ids if clip_id not in entries_by_id]
+        if unknown_ids:
+            raise UnknownClipsError(clip_ids=unknown_ids)
+
+        target_entries = self._sorted_sub_group_entries(manifest, sub_group)
+        target_clip_ids = {entry.id for entry in target_entries}
+        non_matching_ids = [clip_id for clip_id in clip_ids if clip_id not in target_clip_ids]
+        if non_matching_ids:
+            raise ClipIdsNotInSubGroupError(clip_ids=non_matching_ids)
+
+        if target_clip_ids != set(clip_ids):
+            raise ValueError('reorder() clip_id_batches must match exactly the full set of clip ids in the sub-group')
+
+        rewritten_entries_by_id: dict[ClipId, ManifestEntry] = {}
+        for batch_index, clip_id_batch in enumerate(clip_id_batches, start=1):
+            for order_index, clip_id in enumerate(clip_id_batch, start=1):
+                rewritten_entries_by_id[clip_id] = dataclass_replace(
+                    entries_by_id[clip_id],
+                    batch=batch_index,
+                    order=order_index,
+                )
+
+        rewritten_manifest = Manifest([rewritten_entries_by_id.get(entry.id, entry) for entry in manifest])
+
+        await self._write_manifest_and_update_cache(
+            clip_group_prefix=clip_group_prefix,
+            manifest=rewritten_manifest,
+        )
+
+    async def move(
+        self,
+        group: ClipGroup,
+        *,
+        target_sub_group: ClipSubGroup,
+        clip_id_batches: Sequence[Sequence[ClipId]],
+    ) -> None:
+        """Move existing clips into one target sub-group without mutating clip objects."""
+        clip_ids = self._flatten_clip_id_batches(
+            clip_id_batches,
+            operation='move()',
+        )
+        if len(set(clip_ids)) != len(clip_ids):
+            raise DuplicateClipIdsError(clip_ids=clip_ids)
+
+        clip_group_prefix = self._clip_group_prefix(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+        )
+        try:
+            manifest = await self._load_manifest_for_read(clip_group_prefix)
+        except S3ObjectNotFoundError as error:
+            raise ClipGroupNotFoundError(
+                universe=group.universe,
+                year=group.year,
+                season=group.season,
+                sub_season=None,
+                scope=None,
+            ) from error
+
+        entries_by_id = {entry.id: entry for entry in manifest}
+        unknown_ids = [clip_id for clip_id in clip_ids if clip_id not in entries_by_id]
+        if unknown_ids:
+            raise UnknownClipsError(clip_ids=unknown_ids)
+
+        moved_entries = [entries_by_id[clip_id] for clip_id in clip_ids]
+        if any(
+            entry.sub_season == target_sub_group.sub_season and entry.scope == target_sub_group.scope
+            for entry in moved_entries
+        ):
+            raise ValueError(
+                'move() only supports actual cross-sub-group moves; target sub-group clips must not be included'
+            )
+
+        moved_clip_ids = set(clip_ids)
+        rewritten_entries_by_id: dict[ClipId, ManifestEntry] = {}
+        affected_source_sub_groups = {ClipSubGroup(entry.sub_season, entry.scope) for entry in moved_entries}
+
+        target_entries = self._sorted_sub_group_entries(manifest, target_sub_group)
+        next_batch = max((entry.batch for entry in target_entries), default=0) + 1
+        for batch_offset, clip_id_batch in enumerate(clip_id_batches):
+            for order_index, clip_id in enumerate(clip_id_batch, start=1):
+                rewritten_entries_by_id[clip_id] = dataclass_replace(
+                    entries_by_id[clip_id],
+                    sub_season=target_sub_group.sub_season,
+                    scope=target_sub_group.scope,
+                    batch=next_batch + batch_offset,
+                    order=order_index,
+                )
+
+        for source_sub_group in affected_source_sub_groups:
+            remaining_entries = [
+                entry
+                for entry in self._sorted_sub_group_entries(manifest, source_sub_group)
+                if entry.id not in moved_clip_ids
+            ]
+            rewritten_entries_by_id.update(self._build_dense_sub_group_entries(remaining_entries))
+
+        rewritten_manifest = Manifest([rewritten_entries_by_id.get(entry.id, entry) for entry in manifest])
+
+        await self._write_manifest_and_update_cache(
+            clip_group_prefix=clip_group_prefix,
+            manifest=rewritten_manifest,
+        )
+
+    async def remove(
+        self,
+        group: ClipGroup,
+        *,
+        clip_ids: Sequence[ClipId],
+    ) -> None:
+        """Remove many clips plus their authoritative stored objects."""
+        if not clip_ids:
+            raise ValueError('remove() requires at least one clip id')
+        if len(set(clip_ids)) != len(clip_ids):
+            raise DuplicateClipIdsError(clip_ids=clip_ids)
+
+        clip_group_prefix = self._clip_group_prefix(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+        )
+        try:
+            manifest = await self._load_manifest_for_read(clip_group_prefix)
+        except S3ObjectNotFoundError as error:
+            raise ClipGroupNotFoundError(
+                universe=group.universe,
+                year=group.year,
+                season=group.season,
+                sub_season=None,
+                scope=None,
+            ) from error
+
+        entries_by_id = {entry.id: entry for entry in manifest}
+        unknown_ids = [clip_id for clip_id in clip_ids if clip_id not in entries_by_id]
+        if unknown_ids:
+            raise UnknownClipsError(clip_ids=unknown_ids)
+
+        removed_entries = [entries_by_id[clip_id] for clip_id in clip_ids]
+        manifest_key = self._manifest_key(clip_group_prefix)
+        touched_keys: list[Key] = []
+
+        for entry in removed_entries:
+            raw_clip_key = self._clip_key(clip_group_prefix, entry.id)
+            try:
+                await self._s3_client.delete_key(raw_clip_key)
+            except Exception as error:
+                if (
+                    sync_error := self._build_remove_sync_error(
+                        error,
+                        stage='raw_clip_delete',
+                        clip_ids=clip_ids,
+                        touched_keys=touched_keys,
+                        assume_touched_keys=[raw_clip_key],
+                        manifest_key=manifest_key,
+                        note_prefix='Raw clip delete error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            touched_keys.append(raw_clip_key)
+
+            if entry.audio_normalization is None:
+                continue
+
+            normalized_clip_key = self._normalized_clip_key(clip_group_prefix, entry.id)
+            try:
+                await self._s3_client.delete_key(normalized_clip_key)
+            except Exception as error:
+                if (
+                    sync_error := self._build_remove_sync_error(
+                        error,
+                        stage='normalized_clip_delete',
+                        clip_ids=clip_ids,
+                        touched_keys=touched_keys,
+                        assume_touched_keys=[normalized_clip_key],
+                        manifest_key=manifest_key,
+                        note_prefix='Normalized clip delete error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            touched_keys.append(normalized_clip_key)
+
+        removed_clip_ids = set(clip_ids)
+        remaining_entries = [entry for entry in manifest if entry.id not in removed_clip_ids]
+        remaining_manifest = Manifest(remaining_entries)
+        rewritten_entries_by_id: dict[ClipId, ManifestEntry] = {}
+        affected_sub_groups = {ClipSubGroup(entry.sub_season, entry.scope) for entry in removed_entries}
+        for sub_group in affected_sub_groups:
+            sub_group_entries = self._sorted_sub_group_entries(remaining_manifest, sub_group)
+            rewritten_entries_by_id.update(self._build_dense_sub_group_entries(sub_group_entries))
+
+        rewritten_manifest = Manifest([rewritten_entries_by_id.get(entry.id, entry) for entry in remaining_entries])
+
+        if not remaining_entries:
+            try:
+                await self._s3_client.delete_key(manifest_key)
+            except Exception as error:
+                self._manifest_cache.pop(clip_group_prefix, None)
+                sync_error = self._build_remove_sync_error(
+                    error,
+                    stage='manifest_delete',
+                    clip_ids=clip_ids,
+                    touched_keys=touched_keys,
+                    assume_touched_keys=[manifest_key],
+                    manifest_key=manifest_key,
+                    note_prefix='Remove manifest delete error',
+                )
+                if sync_error is None:
+                    raise
+                raise sync_error from error
+            self._manifest_cache.pop(clip_group_prefix, None)
+            return
+
+        try:
+            await self._write_manifest_and_update_cache(
+                clip_group_prefix=clip_group_prefix,
+                manifest=rewritten_manifest,
+            )
+        except Exception as error:
+            sync_error = ClipRemoveManifestSyncError(
+                stage='manifest_write',
+                clip_ids=clip_ids,
+                touched_keys=touched_keys,
+                manifest_key=manifest_key,
+            )
+            sync_error.add_note(f'Remove manifest write error: {error!r}')
+            raise sync_error from error
+
     @staticmethod
     def clip_identity_to_string(
         group: ClipGroup,
@@ -1141,6 +1426,65 @@ class ClipStore:
 
     def _normalized_clip_key(self, clip_group_prefix: Prefix, clip_id: ClipId) -> Key:
         return S3Client.join(clip_group_prefix, clip_id + _NORMALIZED_SUFFIX + Extension.MP4.suffix)
+
+    @staticmethod
+    def _flatten_clip_id_batches(
+        clip_id_batches: Sequence[Sequence[ClipId]],
+        *,
+        operation: str,
+    ) -> list[ClipId]:
+        if not clip_id_batches:
+            raise ValueError(f'{operation} requires at least one clip id')
+        if any(not batch for batch in clip_id_batches):
+            raise ValueError(f'{operation} clip_id_batches must not contain empty batches')
+        clip_ids = [clip_id for batch in clip_id_batches for clip_id in batch]
+        if not clip_ids:
+            raise ValueError(f'{operation} requires at least one clip id')
+        return clip_ids
+
+    @staticmethod
+    def _build_dense_sub_group_entries(entries: Sequence[ManifestEntry]) -> dict[ClipId, ManifestEntry]:
+        rewritten_entries: dict[ClipId, ManifestEntry] = {}
+        current_batch = 0
+        previous_batch: int | None = None
+        next_order = 0
+        for entry in entries:
+            if entry.batch != previous_batch:
+                current_batch += 1
+                previous_batch = entry.batch
+                next_order = 1
+            else:
+                next_order += 1
+            rewritten_entries[entry.id] = dataclass_replace(
+                entry,
+                batch=current_batch,
+                order=next_order,
+            )
+        return rewritten_entries
+
+    @staticmethod
+    def _build_remove_sync_error(
+        error: Exception,
+        *,
+        stage: str,
+        clip_ids: Sequence[ClipId],
+        touched_keys: Sequence[Key],
+        assume_touched_keys: Sequence[Key] = (),
+        manifest_key: Key,
+        note_prefix: str,
+    ) -> ClipRemoveManifestSyncError | None:
+        effective_touched_keys = tuple(dict.fromkeys((*touched_keys, *assume_touched_keys)))
+        if not effective_touched_keys:
+            return None
+
+        sync_error = ClipRemoveManifestSyncError(
+            stage=stage,
+            clip_ids=clip_ids,
+            touched_keys=effective_touched_keys,
+            manifest_key=manifest_key,
+        )
+        sync_error.add_note(f'{note_prefix}: {error!r}')
+        return sync_error
 
     def _new_clip_id(self, *, manifest: Manifest, seen_ids: set[ClipId]) -> ClipId:
         """Return a fresh hex UUIDv7 clip id for a newly created S3 clip object.
