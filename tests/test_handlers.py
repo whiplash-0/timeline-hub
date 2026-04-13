@@ -163,7 +163,7 @@ class _RetrieveClipStore:
 
             yield [FetchedClip(id=clip.id, file=_mp4_file(b'normalized:' + clip.file.data)) for clip in batch]
 
-    async def list_clips(self, group: ClipGroup) -> dict[ClipSubGroup, list[ClipInfo]]:
+    async def list_clips(self, group: ClipGroup) -> dict[ClipSubGroup, list[tuple[ClipInfo, ...]]]:
         return {sub_group: [] for sub_group in self.sub_groups}
 
 

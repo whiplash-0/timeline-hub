@@ -514,7 +514,7 @@ class ClipStore:
         clip_groups = [self._parse_clip_group_prefix(prefix) for prefix in clip_group_prefixes]
         return sorted(clip_groups, key=lambda group: (group.universe.order(), group.year, int(group.season)))
 
-    async def list_clips(self, group: ClipGroup) -> dict[ClipSubGroup, list[ClipInfo]]:
+    async def list_clips(self, group: ClipGroup) -> dict[ClipSubGroup, list[tuple[ClipInfo, ...]]]:
         """List clips grouped by sub-group for a clip group from its manifest."""
         clip_group_prefix = self._clip_group_prefix(
             universe=group.universe,
@@ -540,10 +540,23 @@ class ClipStore:
                 sub_group.scope.value,
             ),
         )
-        return {
-            sub_group: [ClipInfo(id=entry.id) for entry in self._sorted_sub_group_entries(manifest, sub_group)]
-            for sub_group in sorted_sub_groups
-        }
+        clips_by_sub_group: dict[ClipSubGroup, list[tuple[ClipInfo, ...]]] = {}
+        for sub_group in sorted_sub_groups:
+            batches: list[tuple[ClipInfo, ...]] = []
+            current_batch: int | None = None
+            batch_clips: list[ClipInfo] = []
+            for entry in self._sorted_sub_group_entries(manifest, sub_group):
+                if current_batch != entry.batch:
+                    if batch_clips:
+                        batches.append(tuple(batch_clips))
+                    current_batch = entry.batch
+                    batch_clips = []
+                batch_clips.append(ClipInfo(id=entry.id))
+            if batch_clips:
+                batches.append(tuple(batch_clips))
+            clips_by_sub_group[sub_group] = batches
+
+        return clips_by_sub_group
 
     async def store(
         self,

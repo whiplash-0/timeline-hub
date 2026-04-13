@@ -1339,10 +1339,12 @@ async def test_list_clips_returns_unique_sub_groups_as_keys() -> None:
         ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA),
         ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
     ]
-    assert result[ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)] == [ClipInfo(id=_UUID_4)]
+    assert result[ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.EXTRA)] == [
+        (ClipInfo(id=_UUID_4),),
+    ]
     assert result[ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)] == [
-        ClipInfo(id=_UUID_1),
-        ClipInfo(id=_UUID_2),
+        (ClipInfo(id=_UUID_1),),
+        (ClipInfo(id=_UUID_2),),
     ]
 
 
@@ -1394,7 +1396,7 @@ async def test_list_clips_returns_sorted_sub_groups() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_clips_returns_clips_sorted_within_sub_group() -> None:
+async def test_list_clips_returns_batches_sorted_within_sub_group() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     store = ClipStore(
         _FakeS3Client(
@@ -1442,10 +1444,14 @@ async def test_list_clips_returns_clips_sorted_within_sub_group() -> None:
     result = await store.list_clips(ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1))
 
     assert result[ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)] == [
-        ClipInfo(id=_UUID_1),
-        ClipInfo(id=_UUID_2),
-        ClipInfo(id=_UUID_3),
-        ClipInfo(id=_UUID_4),
+        (
+            ClipInfo(id=_UUID_1),
+            ClipInfo(id=_UUID_2),
+        ),
+        (
+            ClipInfo(id=_UUID_3),
+            ClipInfo(id=_UUID_4),
+        ),
     ]
 
 
