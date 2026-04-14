@@ -2485,7 +2485,7 @@ async def test_remove_rejects_unknown_clip_ids() -> None:
 
 
 @pytest.mark.asyncio
-async def test_remove_raises_sync_error_when_later_delete_fails_after_divergence() -> None:
+async def test_remove_raises_cleanup_error_when_raw_delete_fails_after_manifest_commit() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
     original_manifest = _manifest_bytes(
@@ -2509,9 +2509,16 @@ async def test_remove_raises_sync_error_when_later_delete_fails_after_divergence
     )
     store = ClipStore(s3_client)
 
+    clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    clip_group_prefix = store._clip_group_prefix(
+        universe=clip_group.universe,
+        year=clip_group.year,
+        season=clip_group.season,
+    )
+
     with pytest.raises(ClipRemoveManifestSyncError, match='raw_clip_delete') as excinfo:
         await store.remove(
-            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+            clip_group,
             clip_ids=[_UUID_1],
         )
 
@@ -2519,13 +2526,20 @@ async def test_remove_raises_sync_error_when_later_delete_fails_after_divergence
     assert excinfo.value.clip_ids == (_UUID_1,)
     assert excinfo.value.touched_keys == (clip_key_1,)
     assert excinfo.value.manifest_key == manifest_key
-    assert excinfo.value.__notes__ == [f"Raw clip delete error: RuntimeError('boom deleting {clip_key_1}')"]
+    assert excinfo.value.manifest_committed is True
+    assert 'manifest has already been committed' in str(excinfo.value)
+    assert _UUID_1 in str(excinfo.value)
+    assert clip_key_1 in str(excinfo.value)
+    assert 'removed logically' in str(excinfo.value)
+    assert 'Manual cleanup or inspection may be required' in str(excinfo.value)
+    assert f"RuntimeError('boom deleting {clip_key_1}')" in str(excinfo.value)
     assert clip_key_1 in s3_client.objects
-    assert s3_client.objects[manifest_key] == original_manifest
+    assert manifest_key not in s3_client.objects
+    assert clip_group_prefix not in store._manifest_cache
 
 
 @pytest.mark.asyncio
-async def test_remove_raises_sync_error_when_normalized_delete_fails_and_includes_failing_key() -> None:
+async def test_remove_raises_cleanup_error_when_normalized_delete_fails_after_manifest_commit() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
     normalized_key_1 = _normalized_clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
@@ -2563,12 +2577,14 @@ async def test_remove_raises_sync_error_when_normalized_delete_fails_and_include
     assert excinfo.value.clip_ids == (_UUID_1,)
     assert excinfo.value.touched_keys == (clip_key_1, normalized_key_1)
     assert excinfo.value.manifest_key == manifest_key
-    assert excinfo.value.__notes__ == [
-        f"Normalized clip delete error: RuntimeError('boom deleting {normalized_key_1}')"
-    ]
+    assert excinfo.value.manifest_committed is True
+    assert 'manifest has already been committed' in str(excinfo.value)
+    assert normalized_key_1 in str(excinfo.value)
+    assert 'removed logically' in str(excinfo.value)
+    assert f"RuntimeError('boom deleting {normalized_key_1}')" in str(excinfo.value)
     assert clip_key_1 not in s3_client.objects
     assert normalized_key_1 in s3_client.objects
-    assert s3_client.objects[manifest_key] == original_manifest
+    assert manifest_key not in s3_client.objects
 
 
 @pytest.mark.asyncio
@@ -2607,13 +2623,13 @@ async def test_remove_deletes_manifest_instead_of_writing_empty_manifest_for_las
 
     assert clip_key_1 not in s3_client.objects
     assert manifest_key not in s3_client.objects
-    assert s3_client.deleted_keys == [clip_key_1, manifest_key]
+    assert s3_client.deleted_keys == [manifest_key, clip_key_1]
     assert manifest_key not in [key for key, _, _ in s3_client.put_calls]
     assert clip_group_prefix not in store._manifest_cache
 
 
 @pytest.mark.asyncio
-async def test_remove_raises_sync_error_when_manifest_delete_fails_after_last_clip_deletes() -> None:
+async def test_remove_raises_sync_error_when_manifest_delete_fails_before_cleanup_starts() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
     original_manifest = _manifest_bytes(
@@ -2651,17 +2667,19 @@ async def test_remove_raises_sync_error_when_manifest_delete_fails_after_last_cl
 
     assert excinfo.value.stage == 'manifest_delete'
     assert excinfo.value.clip_ids == (_UUID_1,)
-    assert excinfo.value.touched_keys == (clip_key_1, manifest_key)
+    assert excinfo.value.touched_keys == (manifest_key,)
     assert excinfo.value.manifest_key == manifest_key
-    assert excinfo.value.__notes__ == [f"Remove manifest delete error: RuntimeError('boom deleting {manifest_key}')"]
-    assert clip_key_1 not in s3_client.objects
+    assert excinfo.value.manifest_committed is False
+    assert 'manifest commit failed before cleanup started' in str(excinfo.value)
+    assert 'Logical state remains unchanged' in str(excinfo.value)
+    assert clip_key_1 in s3_client.objects
     assert manifest_key in s3_client.objects
     assert s3_client.objects[manifest_key] == original_manifest
-    assert clip_group_prefix not in store._manifest_cache
+    assert clip_group_prefix in store._manifest_cache
 
 
 @pytest.mark.asyncio
-async def test_remove_raises_sync_error_when_manifest_write_fails_after_deletes() -> None:
+async def test_remove_raises_sync_error_when_manifest_write_fails_before_cleanup_starts() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
     clip_key_2 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
@@ -2707,11 +2725,13 @@ async def test_remove_raises_sync_error_when_manifest_write_fails_after_deletes(
 
     assert excinfo.value.stage == 'manifest_write'
     assert excinfo.value.clip_ids == (_UUID_1,)
-    assert excinfo.value.touched_keys == (clip_key_1, normalized_key_1)
+    assert excinfo.value.touched_keys == (manifest_key,)
     assert excinfo.value.manifest_key == manifest_key
-    assert excinfo.value.__notes__ == [f"Remove manifest write error: RuntimeError('boom putting {manifest_key}')"]
-    assert clip_key_1 not in s3_client.objects
-    assert normalized_key_1 not in s3_client.objects
+    assert excinfo.value.manifest_committed is False
+    assert 'manifest commit failed before cleanup started' in str(excinfo.value)
+    assert 'Logical state remains unchanged' in str(excinfo.value)
+    assert clip_key_1 in s3_client.objects
+    assert normalized_key_1 in s3_client.objects
     assert s3_client.objects[manifest_key] == original_manifest
 
 
@@ -3014,7 +3034,7 @@ async def test_reconcile_rejects_clip_ids_missing_from_provided_group_manifest()
 
 
 @pytest.mark.asyncio
-async def test_reconcile_updates_cache_even_if_removed_delete_fails() -> None:
+async def test_reconcile_raises_cleanup_error_after_manifest_commit_and_updates_cache() -> None:
     manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
     clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
     clip_key_2 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
@@ -3047,14 +3067,23 @@ async def test_reconcile_updates_cache_even_if_removed_delete_fails() -> None:
     )
     store = ClipStore(s3_client)
 
-    with pytest.raises(ReconcileDeleteError, match=clip_key_1) as excinfo:
+    with pytest.raises(ReconcileDeleteError, match='raw_clip_delete') as excinfo:
         await store.reconcile(
             ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
             ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
             clip_id_batches=[[_UUID_2]],
         )
 
+    assert excinfo.value.stage == 'raw_clip_delete'
+    assert excinfo.value.clip_ids == (_UUID_1,)
     assert excinfo.value.failed_keys == (clip_key_1,)
+    assert excinfo.value.manifest_key == manifest_key
+    assert excinfo.value.manifest_committed is True
+    assert 'manifest has already been committed' in str(excinfo.value)
+    assert _UUID_1 in str(excinfo.value)
+    assert clip_key_1 in str(excinfo.value)
+    assert 'logical state now follows that manifest' in str(excinfo.value)
+    assert f"RuntimeError('boom deleting {clip_key_1}')" in str(excinfo.value)
     expected_manifest = _manifest_payload(
         [
             ManifestEntry(
@@ -3069,6 +3098,44 @@ async def test_reconcile_updates_cache_even_if_removed_delete_fails() -> None:
     )
     assert list(store._manifest_cache.values())[0].to_dict() == expected_manifest
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == expected_manifest
+
+
+@pytest.mark.asyncio
+async def test_remove_stops_before_normalized_cleanup_when_raw_delete_fails() -> None:
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    normalized_key_1 = _normalized_clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    s3_client = _FakeS3Client(
+        {
+            manifest_key: _manifest_bytes(
+                [
+                    ManifestEntry(
+                        id=_UUID_1,
+                        video_hash=_HASH_A,
+                        sub_season=SubSeason.A,
+                        scope=Scope.COLLECTION,
+                        batch=1,
+                        order=1,
+                        audio_normalization=AudioNormalization(loudness=-14, bitrate=128),
+                    )
+                ]
+            ),
+            clip_key_1: b'one',
+            normalized_key_1: b'normalized-one',
+        },
+        delete_failures={clip_key_1},
+    )
+    store = ClipStore(s3_client)
+
+    with pytest.raises(ClipRemoveManifestSyncError, match='raw_clip_delete') as excinfo:
+        await store.remove(
+            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+            clip_ids=[_UUID_1],
+        )
+
+    assert excinfo.value.touched_keys == (clip_key_1,)
+    assert normalized_key_1 in s3_client.objects
+    assert s3_client.deleted_keys == [manifest_key]
 
 
 @pytest.mark.asyncio

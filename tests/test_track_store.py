@@ -3044,7 +3044,7 @@ async def test_remove_instrumental_rejects_missing_instrumental() -> None:
 
 
 @pytest.mark.asyncio
-async def test_remove_instrumental_wraps_partial_variant_deletion_as_sync_error() -> None:
+async def test_remove_instrumental_fails_fast_after_manifest_commit() -> None:
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     instrumental_key = _instrumental_key(
@@ -3094,7 +3094,11 @@ async def test_remove_instrumental_wraps_partial_variant_deletion_as_sync_error(
     assert excinfo.value.track_id == _UUID_1
     assert excinfo.value.touched_keys == (instrumental_key, *instrumental_variant_keys)
     assert excinfo.value.manifest_key == manifest_key
-    assert str(excinfo.value).startswith('Staged track remove failed')
+    assert excinfo.value.manifest_committed is True
+    assert 'manifest has already been committed' in str(excinfo.value)
+    assert 'instrumental is already removed logically' in str(excinfo.value)
+    assert _UUID_1 in str(excinfo.value)
+    assert instrumental_key in str(excinfo.value)
     assert instrumental_key not in s3_client.objects
     assert instrumental_variant_keys[0] not in s3_client.objects
     assert instrumental_variant_keys[1] in s3_client.objects
@@ -3103,11 +3107,108 @@ async def test_remove_instrumental_wraps_partial_variant_deletion_as_sync_error(
             _entry(
                 id=_UUID_1,
                 preset=AppliedPreset(id=1, version=3, variant_count=2),
-                has_instrumental=True,
-                has_instrumental_variants=True,
+                has_instrumental=False,
+                has_instrumental_variants=False,
             )
         ]
     )
+
+
+@pytest.mark.asyncio
+async def test_remove_instrumental_stops_before_variant_cleanup_when_instrumental_delete_fails() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    instrumental_key = _instrumental_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=_UUID_1,
+    )
+    store = _store(_FakeS3Client())
+    instrumental_variant_keys = tuple(
+        store._variant_storage_keys(
+            track_group_prefix=_track_group_prefix(
+                universe=group.universe,
+                year=group.year,
+                season=group.season,
+            ),
+            track_id=_UUID_1,
+            variant_count=2,
+            instrumental=True,
+        )
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        preset=AppliedPreset(id=1, version=3, variant_count=2),
+                        has_instrumental=True,
+                        has_instrumental_variants=True,
+                    )
+                ]
+            ),
+            instrumental_key: b'instrumental',
+            instrumental_variant_keys[0]: b'inst-1',
+            instrumental_variant_keys[1]: b'inst-2',
+        },
+        delete_failures={instrumental_key},
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(TrackRemoveManifestSyncError, match='instrumental_delete') as excinfo:
+        await store.remove_instrumental(group, _UUID_1)
+
+    assert excinfo.value.stage == 'instrumental_delete'
+    assert excinfo.value.touched_keys == (instrumental_key,)
+    assert s3_client.delete_keys_calls == []
+    assert instrumental_variant_keys[0] in s3_client.objects
+    assert instrumental_variant_keys[1] in s3_client.objects
+
+
+@pytest.mark.asyncio
+async def test_remove_instrumental_manifest_write_failure_is_distinct_from_cleanup_failure() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    instrumental_key = _instrumental_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=_UUID_1,
+    )
+    original_manifest = _manifest_bytes(
+        [
+            _entry(
+                id=_UUID_1,
+                has_instrumental=True,
+                has_instrumental_variants=False,
+            )
+        ]
+    )
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: original_manifest,
+            instrumental_key: b'instrumental',
+        },
+        put_failures={manifest_key},
+    )
+    store = _store(s3_client)
+
+    with pytest.raises(TrackRemoveManifestSyncError, match='manifest_write') as excinfo:
+        await store.remove_instrumental(group, _UUID_1)
+
+    assert excinfo.value.stage == 'manifest_write'
+    assert excinfo.value.track_id == _UUID_1
+    assert excinfo.value.touched_keys == (manifest_key,)
+    assert excinfo.value.manifest_key == manifest_key
+    assert excinfo.value.manifest_committed is False
+    assert 'manifest commit failed before cleanup started' in str(excinfo.value)
+    assert 'Logical state remains unchanged' in str(excinfo.value)
+    assert instrumental_key in s3_client.objects
+    assert s3_client.objects[manifest_key] == original_manifest
 
 
 @pytest.mark.asyncio
@@ -3260,17 +3361,49 @@ async def test_remove_album_linked_track_deletes_only_its_own_cover_object() -> 
 
 
 @pytest.mark.asyncio
-async def test_remove_wraps_later_authoritative_delete_as_sync_error() -> None:
+async def test_remove_fails_fast_after_manifest_commit() -> None:
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
     cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    instrumental_key = _instrumental_key(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+        track_id=_UUID_1,
+    )
+    store = _store(_FakeS3Client())
+    original_variant_keys = tuple(
+        _variant_storage_objects(
+            store,
+            group=group,
+            track_id=_UUID_1,
+            preset=_sample_stored_presets()[0].preset,
+            payload_prefix='orig',
+        ).keys()
+    )
     s3_client = _FakeS3Client(
         objects={
             _presets_key(): _presets_bytes(),
-            manifest_key: _manifest_bytes([_entry(id=_UUID_1)]),
+            manifest_key: _manifest_bytes(
+                [
+                    _entry(
+                        id=_UUID_1,
+                        has_variants=True,
+                        has_instrumental=True,
+                    )
+                ]
+            ),
             track_key: b'track',
             cover_key: b'cover',
+            instrumental_key: b'instrumental',
+            **_variant_storage_objects(
+                store,
+                group=group,
+                track_id=_UUID_1,
+                preset=_sample_stored_presets()[0].preset,
+                payload_prefix='orig',
+            ),
         },
         delete_failures={cover_key},
     )
@@ -3283,19 +3416,31 @@ async def test_remove_wraps_later_authoritative_delete_as_sync_error() -> None:
     assert excinfo.value.track_id == _UUID_1
     assert excinfo.value.touched_keys == (track_key, cover_key)
     assert excinfo.value.manifest_key == manifest_key
-    assert str(excinfo.value).startswith('Staged track remove failed')
+    assert excinfo.value.manifest_committed is True
+    assert 'manifest has already been committed' in str(excinfo.value)
+    assert 'track is already removed logically' in str(excinfo.value)
+    assert track_key in str(excinfo.value)
+    assert cover_key in str(excinfo.value)
     assert track_key not in s3_client.objects
     assert cover_key in s3_client.objects
-    assert s3_client.objects[manifest_key] == _manifest_bytes([_entry(id=_UUID_1)])
+    assert manifest_key not in s3_client.objects
+    assert instrumental_key in s3_client.objects
+    assert all(key in s3_client.objects for key in original_variant_keys)
+    assert s3_client.delete_keys_calls == []
 
 
 @pytest.mark.asyncio
-async def test_remove_raises_sync_error_when_manifest_write_fails_after_deletes() -> None:
+async def test_remove_raises_sync_error_when_manifest_write_fails_before_cleanup_starts() -> None:
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
     cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
-    original_manifest = _manifest_bytes([_entry(id=_UUID_1)])
+    original_manifest = _manifest_bytes(
+        [
+            _entry(id=_UUID_1, order=1),
+            _entry(id=_UUID_2, title='survivor', order=2),
+        ]
+    )
     s3_client = _FakeS3Client(
         objects={
             _presets_key(): _presets_bytes(),
@@ -3312,11 +3457,45 @@ async def test_remove_raises_sync_error_when_manifest_write_fails_after_deletes(
 
     assert excinfo.value.stage == 'manifest_write'
     assert excinfo.value.track_id == _UUID_1
-    assert excinfo.value.touched_keys == (track_key, cover_key)
+    assert excinfo.value.touched_keys == (manifest_key,)
     assert excinfo.value.manifest_key == manifest_key
+    assert excinfo.value.manifest_committed is False
+    assert 'manifest commit failed before cleanup started' in str(excinfo.value)
+    assert 'Logical state remains unchanged' in str(excinfo.value)
+    assert track_key in s3_client.objects
+    assert cover_key in s3_client.objects
+    assert s3_client.objects[manifest_key] == original_manifest
+
+
+@pytest.mark.asyncio
+async def test_remove_last_track_deletes_manifest_before_cleanup() -> None:
+    group = _track_group()
+    manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
+    track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
+    s3_client = _FakeS3Client(
+        objects={
+            _presets_key(): _presets_bytes(),
+            manifest_key: _manifest_bytes([_entry(id=_UUID_1)]),
+            track_key: b'track',
+            cover_key: b'cover',
+        }
+    )
+    store = _store(s3_client)
+    track_group_prefix = _track_group_prefix(
+        universe=group.universe,
+        year=group.year,
+        season=group.season,
+    )
+
+    await store.remove(group, _UUID_1)
+
+    assert manifest_key not in s3_client.objects
     assert track_key not in s3_client.objects
     assert cover_key not in s3_client.objects
-    assert s3_client.objects[manifest_key] == original_manifest
+    assert all(call[0] != manifest_key for call in s3_client.put_calls)
+    assert s3_client.deleted_keys[:3] == [manifest_key, track_key, cover_key]
+    assert track_group_prefix not in store._manifest_cache
 
 
 @pytest.mark.asyncio
@@ -3806,7 +3985,7 @@ async def test_reconcile_wraps_partial_delete_failure_as_sync_error() -> None:
             second_removed_track_key: b'track-2',
             second_removed_cover_key: b'cover-2',
         },
-        delete_failures={second_removed_cover_key},
+        delete_failures={first_removed_cover_key},
     )
     store = _store(s3_client)
 
@@ -3814,19 +3993,24 @@ async def test_reconcile_wraps_partial_delete_failure_as_sync_error() -> None:
         await store.reconcile(group, SubSeason.A, track_ids=[_UUID_1])
 
     assert excinfo.value.stage == 'cover_delete'
-    assert excinfo.value.track_id == second_removed_id
-    assert excinfo.value.touched_keys == (
-        first_removed_track_key,
-        first_removed_cover_key,
-        second_removed_track_key,
-        second_removed_cover_key,
-    )
+    assert excinfo.value.track_id is None
+    assert excinfo.value.track_ids == (first_removed_id, second_removed_id)
+    assert excinfo.value.touched_keys == (first_removed_track_key, first_removed_cover_key)
     assert excinfo.value.manifest_key == manifest_key
+    assert excinfo.value.manifest_committed is True
+    assert 'manifest has already been committed' in str(excinfo.value)
+    assert first_removed_id in str(excinfo.value)
+    assert second_removed_id in str(excinfo.value)
+    assert first_removed_cover_key in str(excinfo.value)
+    assert 'logical state already excludes the removed tracks' in str(excinfo.value)
     assert first_removed_track_key not in s3_client.objects
-    assert first_removed_cover_key not in s3_client.objects
-    assert second_removed_track_key not in s3_client.objects
+    assert first_removed_cover_key in s3_client.objects
+    assert second_removed_track_key in s3_client.objects
     assert second_removed_cover_key in s3_client.objects
-    assert s3_client.objects[manifest_key] == original_manifest
+    assert s3_client.delete_keys_calls == []
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [_entry(id=_UUID_1, title='keep', sub_season=SubSeason.A, order=1)]
+    )
 
 
 def _track_group(

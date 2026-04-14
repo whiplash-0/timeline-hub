@@ -438,11 +438,38 @@ class ClipManifestSyncError(RuntimeError):
 
 
 class ReconcileDeleteError(RuntimeError):
-    """Raised when reconcile cannot fully delete removed clip objects."""
+    """Raised when clip reconcile commit or post-commit cleanup does not fully complete."""
 
-    def __init__(self, *, failed_keys: Sequence[Key]) -> None:
-        self.failed_keys = tuple(failed_keys)
-        super().__init__(f'Reconcile cleanup failed for {len(self.failed_keys)} removed keys: {list(self.failed_keys)}')
+    def __init__(
+        self,
+        *,
+        stage: str,
+        clip_ids: Sequence[ClipId],
+        touched_keys: Sequence[Key],
+        manifest_key: Key,
+        manifest_committed: bool,
+        logical_state: str,
+        failure_detail: str | None = None,
+    ) -> None:
+        self.stage = stage
+        self.clip_ids = tuple(clip_ids)
+        self.failed_keys = tuple(touched_keys)
+        self.manifest_key = manifest_key
+        self.manifest_committed = manifest_committed
+        self.logical_state = logical_state
+        self.failure_detail = failure_detail
+        manifest_status = (
+            'manifest has already been committed'
+            if self.manifest_committed
+            else 'manifest commit failed before cleanup started'
+        )
+        detail_suffix = f'; original error: {self.failure_detail}' if self.failure_detail is not None else ''
+        super().__init__(
+            f'Clip reconcile failed at stage={self.stage} for clip ids {list(self.clip_ids)}; '
+            f'{manifest_status}; manifest key: {self.manifest_key}; {self.logical_state}; '
+            f'touched/failed object keys: {list(self.failed_keys)}{detail_suffix}. '
+            'Manual cleanup or inspection may be required for the listed keys.'
+        )
 
 
 class NormalizedClipManifestSyncError(RuntimeError):
@@ -466,24 +493,39 @@ class NormalizedClipManifestSyncError(RuntimeError):
 
 
 class ClipRemoveManifestSyncError(RuntimeError):
-    """Raised when staged clip removals are not synchronized back into manifest state."""
+    """Raised when clip removal commit or post-commit cleanup does not fully complete."""
 
     def __init__(
         self,
         *,
+        operation: str,
         stage: str,
         clip_ids: Sequence[ClipId],
         touched_keys: Sequence[Key],
         manifest_key: Key,
+        manifest_committed: bool,
+        logical_state: str,
+        failure_detail: str | None = None,
     ) -> None:
+        self.operation = operation
         self.stage = stage
         self.clip_ids = tuple(clip_ids)
         self.touched_keys = tuple(touched_keys)
         self.manifest_key = manifest_key
+        self.manifest_committed = manifest_committed
+        self.logical_state = logical_state
+        self.failure_detail = failure_detail
+        manifest_status = (
+            'manifest has already been committed'
+            if self.manifest_committed
+            else 'manifest commit failed before cleanup started'
+        )
+        detail_suffix = f'; original error: {self.failure_detail}' if self.failure_detail is not None else ''
         super().__init__(
-            f'Staged clip remove failed at {self.stage} for clip ids {list(self.clip_ids)}; '
-            f'touched keys: {list(self.touched_keys)}; '
-            f'manifest key not synchronized: {self.manifest_key}'
+            f'Clip {self.operation} failed at stage={self.stage} for clip ids {list(self.clip_ids)}; '
+            f'{manifest_status}; manifest key: {self.manifest_key}; {self.logical_state}; '
+            f'touched/failed keys: {list(self.touched_keys)}{detail_suffix}. '
+            'Manual cleanup or inspection may be required for the listed keys.'
         )
 
 
@@ -1066,7 +1108,8 @@ class ClipStore:
             UnknownClipsError: If a parsed clip id is not present in the provided clip group's manifest.
             ClipGroupNotFoundError: If the requested clip group has no manifest.
             ManifestCorruptedError: If the clip-group manifest exists but is malformed.
-            ReconcileDeleteError: If one or more removed clip objects cannot be deleted after the manifest rewrite.
+            ReconcileDeleteError: If manifest commit fails before cleanup starts or if removed clip cleanup fails
+                after the manifest rewrite.
         """
         clip_ids = self._flatten_clip_id_batches(
             clip_id_batches,
@@ -1099,7 +1142,6 @@ class ClipStore:
         existing_target_entries = [
             entry for entry in manifest if entry.scope is sub_group.scope and entry.sub_season is sub_group.sub_season
         ]
-        old_subgroup_ids = {entry.id for entry in existing_target_entries}
 
         new_entries: list[ManifestEntry] = []
         new_subgroup_ids: set[ClipId] = set()
@@ -1129,38 +1171,67 @@ class ClipStore:
 
         rewritten_entries.extend(new_entries)
         rewritten_manifest = Manifest(rewritten_entries)
-        await self._write_manifest_and_update_cache(
-            clip_group_prefix=clip_group_prefix,
-            manifest=rewritten_manifest,
-        )
+        manifest_key = self._manifest_key(clip_group_prefix)
+        removed_entries = [entry for entry in existing_target_entries if entry.id not in new_subgroup_ids]
+        removed_ids = [entry.id for entry in removed_entries]
 
-        # The manifest is authoritative, so cache must track the rewritten
-        # manifest even if deleting removed clip objects fails afterwards.
+        try:
+            await self._write_manifest_and_update_cache(
+                clip_group_prefix=clip_group_prefix,
+                manifest=rewritten_manifest,
+            )
+        except Exception as error:
+            sync_error = ReconcileDeleteError(
+                stage='manifest_write',
+                clip_ids=removed_ids,
+                touched_keys=[manifest_key],
+                manifest_key=manifest_key,
+                manifest_committed=False,
+                logical_state='Logical state remains unchanged because reconcile cleanup did not start.',
+            )
+            sync_error.add_note(f'Reconcile manifest write error: {error!r}')
+            raise sync_error from error
 
-        removed_ids = old_subgroup_ids - new_subgroup_ids
-        failed_keys: list[Key] = []
-        for removed_id in removed_ids:
-            removed_entry = entries_by_id[removed_id]
-            raw_clip_key = self._clip_key(clip_group_prefix, removed_id)
+        touched_keys: list[Key] = []
+        for removed_entry in removed_entries:
+            raw_clip_key = self._clip_key(clip_group_prefix, removed_entry.id)
+            touched_keys.append(raw_clip_key)
             try:
                 await self._s3_client.delete_key(raw_clip_key)
             except Exception as exc:
                 logger.error('Failed to delete key {}: {}', raw_clip_key, exc)
-                failed_keys.append(raw_clip_key)
-            if removed_entry.audio_normalization is not None:
-                normalized_clip_key = self._normalized_clip_key(clip_group_prefix, removed_id)
-                try:
-                    await self._s3_client.delete_key(normalized_clip_key)
-                except Exception as exc:
-                    logger.error('Failed to delete key {}: {}', normalized_clip_key, exc)
-                    failed_keys.append(normalized_clip_key)
+                raise ReconcileDeleteError(
+                    stage='raw_clip_delete',
+                    clip_ids=removed_ids,
+                    touched_keys=touched_keys,
+                    manifest_key=manifest_key,
+                    manifest_committed=True,
+                    logical_state='Manifest was already committed, and logical state now follows that manifest.',
+                    failure_detail=repr(exc),
+                ) from exc
 
-        if failed_keys:
-            raise ReconcileDeleteError(failed_keys=failed_keys)
+            if removed_entry.audio_normalization is None:
+                continue
+
+            normalized_clip_key = self._normalized_clip_key(clip_group_prefix, removed_entry.id)
+            touched_keys.append(normalized_clip_key)
+            try:
+                await self._s3_client.delete_key(normalized_clip_key)
+            except Exception as exc:
+                logger.error('Failed to delete key {}: {}', normalized_clip_key, exc)
+                raise ReconcileDeleteError(
+                    stage='normalized_clip_delete',
+                    clip_ids=removed_ids,
+                    touched_keys=touched_keys,
+                    manifest_key=manifest_key,
+                    manifest_committed=True,
+                    logical_state='Manifest was already committed, and logical state now follows that manifest.',
+                    failure_detail=repr(exc),
+                ) from exc
 
         return ReconcileResult(
             updated=len(new_entries),
-            removed=len(removed_ids),
+            removed=len(removed_entries),
         )
 
     async def remove(
@@ -1198,50 +1269,6 @@ class ClipStore:
 
         removed_entries = [entries_by_id[clip_id] for clip_id in clip_ids]
         manifest_key = self._manifest_key(clip_group_prefix)
-        touched_keys: list[Key] = []
-
-        for entry in removed_entries:
-            raw_clip_key = self._clip_key(clip_group_prefix, entry.id)
-            try:
-                await self._s3_client.delete_key(raw_clip_key)
-            except Exception as error:
-                if (
-                    sync_error := self._build_remove_sync_error(
-                        error,
-                        stage='raw_clip_delete',
-                        clip_ids=clip_ids,
-                        touched_keys=touched_keys,
-                        assume_touched_keys=[raw_clip_key],
-                        manifest_key=manifest_key,
-                        note_prefix='Raw clip delete error',
-                    )
-                ) is None:
-                    raise
-                raise sync_error from error
-            touched_keys.append(raw_clip_key)
-
-            if entry.audio_normalization is None:
-                continue
-
-            normalized_clip_key = self._normalized_clip_key(clip_group_prefix, entry.id)
-            try:
-                await self._s3_client.delete_key(normalized_clip_key)
-            except Exception as error:
-                if (
-                    sync_error := self._build_remove_sync_error(
-                        error,
-                        stage='normalized_clip_delete',
-                        clip_ids=clip_ids,
-                        touched_keys=touched_keys,
-                        assume_touched_keys=[normalized_clip_key],
-                        manifest_key=manifest_key,
-                        note_prefix='Normalized clip delete error',
-                    )
-                ) is None:
-                    raise
-                raise sync_error from error
-            touched_keys.append(normalized_clip_key)
-
         removed_clip_ids = set(clip_ids)
         remaining_entries = [entry for entry in manifest if entry.id not in removed_clip_ids]
         remaining_manifest = Manifest(remaining_entries)
@@ -1253,40 +1280,64 @@ class ClipStore:
 
         rewritten_manifest = Manifest([rewritten_entries_by_id.get(entry.id, entry) for entry in remaining_entries])
 
-        if not remaining_entries:
-            try:
-                await self._s3_client.delete_key(manifest_key)
-            except Exception as error:
-                self._manifest_cache.pop(clip_group_prefix, None)
-                sync_error = self._build_remove_sync_error(
-                    error,
-                    stage='manifest_delete',
-                    clip_ids=clip_ids,
-                    touched_keys=touched_keys,
-                    assume_touched_keys=[manifest_key],
-                    manifest_key=manifest_key,
-                    note_prefix='Remove manifest delete error',
-                )
-                if sync_error is None:
-                    raise
-                raise sync_error from error
-            self._manifest_cache.pop(clip_group_prefix, None)
-            return
-
         try:
-            await self._write_manifest_and_update_cache(
+            await self._commit_manifest_state(
                 clip_group_prefix=clip_group_prefix,
                 manifest=rewritten_manifest,
             )
         except Exception as error:
             sync_error = ClipRemoveManifestSyncError(
-                stage='manifest_write',
+                operation='remove',
+                stage='manifest_delete' if not remaining_entries else 'manifest_write',
                 clip_ids=clip_ids,
-                touched_keys=touched_keys,
+                touched_keys=[manifest_key],
                 manifest_key=manifest_key,
+                manifest_committed=False,
+                logical_state='Logical state remains unchanged because authoritative object cleanup did not start.',
             )
-            sync_error.add_note(f'Remove manifest write error: {error!r}')
+            sync_error.add_note(f'Remove manifest {"delete" if not remaining_entries else "write"} error: {error!r}')
             raise sync_error from error
+
+        touched_keys: list[Key] = []
+        for entry in removed_entries:
+            raw_clip_key = self._clip_key(clip_group_prefix, entry.id)
+            touched_keys.append(raw_clip_key)
+            try:
+                await self._s3_client.delete_key(raw_clip_key)
+            except Exception as error:
+                raise ClipRemoveManifestSyncError(
+                    operation='remove cleanup',
+                    stage='raw_clip_delete',
+                    clip_ids=clip_ids,
+                    touched_keys=touched_keys,
+                    manifest_key=manifest_key,
+                    manifest_committed=True,
+                    logical_state=(
+                        'Manifest commit already succeeded, so the removed clips are already removed logically.'
+                    ),
+                    failure_detail=repr(error),
+                ) from error
+
+            if entry.audio_normalization is None:
+                continue
+
+            normalized_clip_key = self._normalized_clip_key(clip_group_prefix, entry.id)
+            touched_keys.append(normalized_clip_key)
+            try:
+                await self._s3_client.delete_key(normalized_clip_key)
+            except Exception as error:
+                raise ClipRemoveManifestSyncError(
+                    operation='remove cleanup',
+                    stage='normalized_clip_delete',
+                    clip_ids=clip_ids,
+                    touched_keys=touched_keys,
+                    manifest_key=manifest_key,
+                    manifest_committed=True,
+                    logical_state=(
+                        'Manifest commit already succeeded, so the removed clips are already removed logically.'
+                    ),
+                    failure_detail=repr(error),
+                ) from error
 
     @staticmethod
     def clip_identity_to_string(
@@ -1476,13 +1527,32 @@ class ClipStore:
             return None
 
         sync_error = ClipRemoveManifestSyncError(
+            operation='remove',
             stage=stage,
             clip_ids=clip_ids,
             touched_keys=effective_touched_keys,
             manifest_key=manifest_key,
+            manifest_committed=False,
+            logical_state='Logical state may still follow the previous manifest because cleanup did not complete.',
         )
         sync_error.add_note(f'{note_prefix}: {error!r}')
         return sync_error
+
+    async def _commit_manifest_state(
+        self,
+        *,
+        clip_group_prefix: Prefix,
+        manifest: Manifest,
+    ) -> None:
+        if len(manifest) == 0:
+            await self._s3_client.delete_key(self._manifest_key(clip_group_prefix))
+            self._manifest_cache.pop(clip_group_prefix, None)
+            return
+
+        await self._write_manifest_and_update_cache(
+            clip_group_prefix=clip_group_prefix,
+            manifest=manifest,
+        )
 
     def _new_clip_id(self, *, manifest: Manifest, seen_ids: set[ClipId]) -> ClipId:
         """Return a fresh hex UUIDv7 clip id for a newly created S3 clip object.
