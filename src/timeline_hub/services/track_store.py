@@ -1042,6 +1042,304 @@ class TrackStore:
             for sub_season in sorted(grouped_entries, key=lambda value: value.order())
         }
 
+    async def fetch(
+        self,
+        group: TrackGroup,
+        track_id: TrackId,
+        *,
+        preset_id: PresetId | None = None,
+    ) -> FetchedVariants:
+        """Fetch one track's generated variants, materializing stale caches lazily.
+
+        The selected track is identified by `(group, track_id)`. The returned
+        payload contains only generated variants plus shared UI metadata:
+        cover `FileBytes`. The authoritative original track and optional
+        authoritative instrumental objects are read only when regeneration is
+        required. Persisted source and generated audio objects use `.opus` S3
+        keys, and per-track covers use `.jpg` S3 keys. Returned audio always
+        uses `Extension.OPUS`, and returned covers always use `Extension.JPG`.
+
+        Preset resolution is delegated to `PresetStore`. An explicit
+        caller-supplied preset id is strict, while the manifest snapshot id is
+        tolerant of stale or deleted presets and falls back to the current
+        default preset.
+
+        Staleness is determined only by the manifest's cached `AppliedPreset`
+        metadata, the resolved source-of-truth `PresetRecord`, the
+        `has_variants` flag, and the `has_instrumental_variants` flag. No S3
+        listing is used. Variants are returned in strictly ascending speed
+        order across all slowed and sped-up modes, and that same ordering
+        determines their stable indexed storage keys.
+
+        Variant generation is intentionally not atomic. If uploads succeed but
+        manifest persistence fails, orphaned variant objects may remain in
+        storage for manual cleanup, matching the store path's existing staged
+        write semantics.
+
+        This method may perform object and manifest writes during variant
+        generation. It is not a pure read operation. Concurrent operations on
+        the same `TrackGroup` are not supported and may lead to lost updates.
+
+        Cover reads intentionally stay per-track. Album linkage is not used as
+        a fetch-time indirection because each track stores its own physical
+        cover copy.
+
+        Raises:
+            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
+            TrackGroupNotFoundError: If the requested group manifest does not exist.
+            TrackManifestCorruptedError: If the requested group manifest exists but is malformed.
+            ValueError: If `track_id` is missing from the manifest.
+            ValueError: If caller-supplied `preset_id` does not refer to a known preset.
+        """
+        track_group_prefix = self._track_group_prefix(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+        )
+        manifest = await self._require_group_manifest(group, sub_season=None)
+        entry = self._require_manifest_entry(manifest, group=group, track_id=track_id)
+
+        if preset_id is not None:
+            resolved_stored_preset = await self._preset_store.require(preset_id)
+        else:
+            try:
+                resolved_stored_preset = await self._preset_store.require(entry.preset.id)
+            except ValueError:
+                resolved_stored_preset = await self._preset_store.default()
+
+        cover_key = self._cover_key(track_group_prefix, track_id)
+        cover_bytes = await self._s3_client.get_bytes(cover_key)
+
+        variant_specs = self._resolve_variant_specs(resolved_stored_preset.preset)
+        variant_count = len(variant_specs)
+        manifest_key = self._manifest_key(track_group_prefix)
+        touched_keys: list[Key] = []
+
+        original_is_current = entry.has_variants and self._is_applied_preset_current(
+            entry.preset,
+            resolved_preset=resolved_stored_preset,
+            variant_count=variant_count,
+        )
+        instrumental_is_current = (
+            entry.has_instrumental
+            and entry.has_instrumental_variants
+            and self._is_applied_preset_current(
+                entry.preset,
+                resolved_preset=resolved_stored_preset,
+                variant_count=variant_count,
+            )
+        )
+
+        original_regenerated = False
+        if original_is_current:
+            variants = await self._load_variants(
+                track_group_prefix=track_group_prefix,
+                track_id=track_id,
+                variant_specs=variant_specs,
+                instrumental=False,
+            )
+        else:
+            if entry.has_variants:
+                original_variant_keys = self._variant_storage_keys(
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    variant_count=entry.preset.variant_count,
+                    instrumental=False,
+                )
+                try:
+                    await self._delete_variants(
+                        track_group_prefix=track_group_prefix,
+                        track_id=track_id,
+                        variant_count=entry.preset.variant_count,
+                        instrumental=False,
+                    )
+                except Exception as error:
+                    if (
+                        sync_error := self._build_fetch_sync_error(
+                            error,
+                            stage='original_variant_delete',
+                            track_id=track_id,
+                            touched_keys=touched_keys,
+                            assume_touched_keys=original_variant_keys,
+                            manifest_key=manifest_key,
+                            note_prefix='Original variant delete error',
+                        )
+                    ) is None:
+                        raise
+                    raise sync_error from error
+                touched_keys.extend(original_variant_keys)
+
+            try:
+                source_track_bytes = await self._s3_client.get_bytes(self._track_key(track_group_prefix, track_id))
+            except Exception as error:
+                if (
+                    sync_error := self._build_fetch_sync_error(
+                        error,
+                        stage='original_source_read',
+                        track_id=track_id,
+                        touched_keys=touched_keys,
+                        manifest_key=manifest_key,
+                        note_prefix='Original source read error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            uploaded_original_variant_keys: list[Key] = []
+            try:
+                variants = await self._generate_and_store_variants(
+                    source_bytes=source_track_bytes,
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    variant_specs=variant_specs,
+                    instrumental=False,
+                    uploaded_keys=uploaded_original_variant_keys,
+                )
+            except Exception as error:
+                if (
+                    sync_error := self._build_fetch_sync_error(
+                        error,
+                        stage='original_variant_upload',
+                        track_id=track_id,
+                        touched_keys=touched_keys,
+                        assume_touched_keys=uploaded_original_variant_keys,
+                        manifest_key=manifest_key,
+                        note_prefix='Original variant upload error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            touched_keys.extend(uploaded_original_variant_keys)
+            original_regenerated = True
+
+        instrumental_variants: tuple[FetchedVariant, ...] | None
+        instrumental_regenerated = False
+        if not entry.has_instrumental:
+            instrumental_variants = None
+        elif instrumental_is_current:
+            instrumental_variants = await self._load_variants(
+                track_group_prefix=track_group_prefix,
+                track_id=track_id,
+                variant_specs=variant_specs,
+                instrumental=True,
+            )
+        else:
+            if entry.has_instrumental_variants:
+                instrumental_variant_keys = self._variant_storage_keys(
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    variant_count=entry.preset.variant_count,
+                    instrumental=True,
+                )
+                try:
+                    await self._delete_variants(
+                        track_group_prefix=track_group_prefix,
+                        track_id=track_id,
+                        variant_count=entry.preset.variant_count,
+                        instrumental=True,
+                    )
+                except Exception as error:
+                    if (
+                        sync_error := self._build_fetch_sync_error(
+                            error,
+                            stage='instrumental_variant_delete',
+                            track_id=track_id,
+                            touched_keys=touched_keys,
+                            assume_touched_keys=instrumental_variant_keys,
+                            manifest_key=manifest_key,
+                            note_prefix='Instrumental variant delete error',
+                        )
+                    ) is None:
+                        raise
+                    raise sync_error from error
+                touched_keys.extend(instrumental_variant_keys)
+
+            try:
+                source_instrumental_bytes = await self._s3_client.get_bytes(
+                    self._instrumental_key(track_group_prefix, track_id)
+                )
+            except Exception as error:
+                if (
+                    sync_error := self._build_fetch_sync_error(
+                        error,
+                        stage='instrumental_source_read',
+                        track_id=track_id,
+                        touched_keys=touched_keys,
+                        manifest_key=manifest_key,
+                        note_prefix='Instrumental source read error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            uploaded_instrumental_variant_keys: list[Key] = []
+            try:
+                instrumental_variants = await self._generate_and_store_variants(
+                    source_bytes=source_instrumental_bytes,
+                    track_group_prefix=track_group_prefix,
+                    track_id=track_id,
+                    variant_specs=variant_specs,
+                    instrumental=True,
+                    uploaded_keys=uploaded_instrumental_variant_keys,
+                )
+            except Exception as error:
+                if (
+                    sync_error := self._build_fetch_sync_error(
+                        error,
+                        stage='instrumental_variant_upload',
+                        track_id=track_id,
+                        touched_keys=touched_keys,
+                        assume_touched_keys=uploaded_instrumental_variant_keys,
+                        manifest_key=manifest_key,
+                        note_prefix='Instrumental variant upload error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+            touched_keys.extend(uploaded_instrumental_variant_keys)
+            instrumental_regenerated = True
+
+        if original_regenerated or instrumental_regenerated:
+            try:
+                await self._write_manifest_and_update_cache(
+                    track_group_prefix=track_group_prefix,
+                    manifest=self._replace_manifest_entry(
+                        manifest,
+                        updated_entry=dataclass_replace(
+                            entry,
+                            preset=AppliedPreset(
+                                id=resolved_stored_preset.id,
+                                version=resolved_stored_preset.version,
+                                variant_count=variant_count,
+                            ),
+                            has_variants=True if original_regenerated else entry.has_variants,
+                            has_instrumental_variants=(
+                                True if instrumental_regenerated else entry.has_instrumental_variants
+                            ),
+                        ),
+                    ),
+                )
+            except Exception as error:
+                if (
+                    sync_error := self._build_fetch_sync_error(
+                        error,
+                        stage='manifest_write',
+                        track_id=track_id,
+                        touched_keys=touched_keys,
+                        manifest_key=manifest_key,
+                        note_prefix='Fetch manifest write error',
+                    )
+                ) is None:
+                    raise
+                raise sync_error from error
+
+        return FetchedVariants(
+            track_id=entry.id,
+            artists=entry.artists,
+            title=entry.title,
+            cover=FileBytes(data=cover_bytes, extension=Extension.JPG),
+            variants=variants,
+            instrumental_variants=instrumental_variants,
+        )
+
     async def store(
         self,
         group: TrackGroup,
@@ -1860,304 +2158,6 @@ class TrackStore:
             ) is None:
                 raise
             raise sync_error from error
-
-    async def fetch(
-        self,
-        group: TrackGroup,
-        track_id: TrackId,
-        *,
-        preset_id: PresetId | None = None,
-    ) -> FetchedVariants:
-        """Fetch one track's generated variants, materializing stale caches lazily.
-
-        The selected track is identified by `(group, track_id)`. The returned
-        payload contains only generated variants plus shared UI metadata:
-        cover `FileBytes`. The authoritative original track and optional
-        authoritative instrumental objects are read only when regeneration is
-        required. Persisted source and generated audio objects use `.opus` S3
-        keys, and per-track covers use `.jpg` S3 keys. Returned audio always
-        uses `Extension.OPUS`, and returned covers always use `Extension.JPG`.
-
-        Preset resolution is delegated to `PresetStore`. An explicit
-        caller-supplied preset id is strict, while the manifest snapshot id is
-        tolerant of stale or deleted presets and falls back to the current
-        default preset.
-
-        Staleness is determined only by the manifest's cached `AppliedPreset`
-        metadata, the resolved source-of-truth `PresetRecord`, the
-        `has_variants` flag, and the `has_instrumental_variants` flag. No S3
-        listing is used. Variants are returned in strictly ascending speed
-        order across all slowed and sped-up modes, and that same ordering
-        determines their stable indexed storage keys.
-
-        Variant generation is intentionally not atomic. If uploads succeed but
-        manifest persistence fails, orphaned variant objects may remain in
-        storage for manual cleanup, matching the store path's existing staged
-        write semantics.
-
-        This method may perform object and manifest writes during variant
-        generation. It is not a pure read operation. Concurrent operations on
-        the same `TrackGroup` are not supported and may lead to lost updates.
-
-        Cover reads intentionally stay per-track. Album linkage is not used as
-        a fetch-time indirection because each track stores its own physical
-        cover copy.
-
-        Raises:
-            TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
-            TrackGroupNotFoundError: If the requested group manifest does not exist.
-            TrackManifestCorruptedError: If the requested group manifest exists but is malformed.
-            ValueError: If `track_id` is missing from the manifest.
-            ValueError: If caller-supplied `preset_id` does not refer to a known preset.
-        """
-        track_group_prefix = self._track_group_prefix(
-            universe=group.universe,
-            year=group.year,
-            season=group.season,
-        )
-        manifest = await self._require_group_manifest(group, sub_season=None)
-        entry = self._require_manifest_entry(manifest, group=group, track_id=track_id)
-
-        if preset_id is not None:
-            resolved_stored_preset = await self._preset_store.require(preset_id)
-        else:
-            try:
-                resolved_stored_preset = await self._preset_store.require(entry.preset.id)
-            except ValueError:
-                resolved_stored_preset = await self._preset_store.default()
-
-        cover_key = self._cover_key(track_group_prefix, track_id)
-        cover_bytes = await self._s3_client.get_bytes(cover_key)
-
-        variant_specs = self._resolve_variant_specs(resolved_stored_preset.preset)
-        variant_count = len(variant_specs)
-        manifest_key = self._manifest_key(track_group_prefix)
-        touched_keys: list[Key] = []
-
-        original_is_current = entry.has_variants and self._is_applied_preset_current(
-            entry.preset,
-            resolved_preset=resolved_stored_preset,
-            variant_count=variant_count,
-        )
-        instrumental_is_current = (
-            entry.has_instrumental
-            and entry.has_instrumental_variants
-            and self._is_applied_preset_current(
-                entry.preset,
-                resolved_preset=resolved_stored_preset,
-                variant_count=variant_count,
-            )
-        )
-
-        original_regenerated = False
-        if original_is_current:
-            variants = await self._load_variants(
-                track_group_prefix=track_group_prefix,
-                track_id=track_id,
-                variant_specs=variant_specs,
-                instrumental=False,
-            )
-        else:
-            if entry.has_variants:
-                original_variant_keys = self._variant_storage_keys(
-                    track_group_prefix=track_group_prefix,
-                    track_id=track_id,
-                    variant_count=entry.preset.variant_count,
-                    instrumental=False,
-                )
-                try:
-                    await self._delete_variants(
-                        track_group_prefix=track_group_prefix,
-                        track_id=track_id,
-                        variant_count=entry.preset.variant_count,
-                        instrumental=False,
-                    )
-                except Exception as error:
-                    if (
-                        sync_error := self._build_fetch_sync_error(
-                            error,
-                            stage='original_variant_delete',
-                            track_id=track_id,
-                            touched_keys=touched_keys,
-                            assume_touched_keys=original_variant_keys,
-                            manifest_key=manifest_key,
-                            note_prefix='Original variant delete error',
-                        )
-                    ) is None:
-                        raise
-                    raise sync_error from error
-                touched_keys.extend(original_variant_keys)
-
-            try:
-                source_track_bytes = await self._s3_client.get_bytes(self._track_key(track_group_prefix, track_id))
-            except Exception as error:
-                if (
-                    sync_error := self._build_fetch_sync_error(
-                        error,
-                        stage='original_source_read',
-                        track_id=track_id,
-                        touched_keys=touched_keys,
-                        manifest_key=manifest_key,
-                        note_prefix='Original source read error',
-                    )
-                ) is None:
-                    raise
-                raise sync_error from error
-            uploaded_original_variant_keys: list[Key] = []
-            try:
-                variants = await self._generate_and_store_variants(
-                    source_bytes=source_track_bytes,
-                    track_group_prefix=track_group_prefix,
-                    track_id=track_id,
-                    variant_specs=variant_specs,
-                    instrumental=False,
-                    uploaded_keys=uploaded_original_variant_keys,
-                )
-            except Exception as error:
-                if (
-                    sync_error := self._build_fetch_sync_error(
-                        error,
-                        stage='original_variant_upload',
-                        track_id=track_id,
-                        touched_keys=touched_keys,
-                        assume_touched_keys=uploaded_original_variant_keys,
-                        manifest_key=manifest_key,
-                        note_prefix='Original variant upload error',
-                    )
-                ) is None:
-                    raise
-                raise sync_error from error
-            touched_keys.extend(uploaded_original_variant_keys)
-            original_regenerated = True
-
-        instrumental_variants: tuple[FetchedVariant, ...] | None
-        instrumental_regenerated = False
-        if not entry.has_instrumental:
-            instrumental_variants = None
-        elif instrumental_is_current:
-            instrumental_variants = await self._load_variants(
-                track_group_prefix=track_group_prefix,
-                track_id=track_id,
-                variant_specs=variant_specs,
-                instrumental=True,
-            )
-        else:
-            if entry.has_instrumental_variants:
-                instrumental_variant_keys = self._variant_storage_keys(
-                    track_group_prefix=track_group_prefix,
-                    track_id=track_id,
-                    variant_count=entry.preset.variant_count,
-                    instrumental=True,
-                )
-                try:
-                    await self._delete_variants(
-                        track_group_prefix=track_group_prefix,
-                        track_id=track_id,
-                        variant_count=entry.preset.variant_count,
-                        instrumental=True,
-                    )
-                except Exception as error:
-                    if (
-                        sync_error := self._build_fetch_sync_error(
-                            error,
-                            stage='instrumental_variant_delete',
-                            track_id=track_id,
-                            touched_keys=touched_keys,
-                            assume_touched_keys=instrumental_variant_keys,
-                            manifest_key=manifest_key,
-                            note_prefix='Instrumental variant delete error',
-                        )
-                    ) is None:
-                        raise
-                    raise sync_error from error
-                touched_keys.extend(instrumental_variant_keys)
-
-            try:
-                source_instrumental_bytes = await self._s3_client.get_bytes(
-                    self._instrumental_key(track_group_prefix, track_id)
-                )
-            except Exception as error:
-                if (
-                    sync_error := self._build_fetch_sync_error(
-                        error,
-                        stage='instrumental_source_read',
-                        track_id=track_id,
-                        touched_keys=touched_keys,
-                        manifest_key=manifest_key,
-                        note_prefix='Instrumental source read error',
-                    )
-                ) is None:
-                    raise
-                raise sync_error from error
-            uploaded_instrumental_variant_keys: list[Key] = []
-            try:
-                instrumental_variants = await self._generate_and_store_variants(
-                    source_bytes=source_instrumental_bytes,
-                    track_group_prefix=track_group_prefix,
-                    track_id=track_id,
-                    variant_specs=variant_specs,
-                    instrumental=True,
-                    uploaded_keys=uploaded_instrumental_variant_keys,
-                )
-            except Exception as error:
-                if (
-                    sync_error := self._build_fetch_sync_error(
-                        error,
-                        stage='instrumental_variant_upload',
-                        track_id=track_id,
-                        touched_keys=touched_keys,
-                        assume_touched_keys=uploaded_instrumental_variant_keys,
-                        manifest_key=manifest_key,
-                        note_prefix='Instrumental variant upload error',
-                    )
-                ) is None:
-                    raise
-                raise sync_error from error
-            touched_keys.extend(uploaded_instrumental_variant_keys)
-            instrumental_regenerated = True
-
-        if original_regenerated or instrumental_regenerated:
-            try:
-                await self._write_manifest_and_update_cache(
-                    track_group_prefix=track_group_prefix,
-                    manifest=self._replace_manifest_entry(
-                        manifest,
-                        updated_entry=dataclass_replace(
-                            entry,
-                            preset=AppliedPreset(
-                                id=resolved_stored_preset.id,
-                                version=resolved_stored_preset.version,
-                                variant_count=variant_count,
-                            ),
-                            has_variants=True if original_regenerated else entry.has_variants,
-                            has_instrumental_variants=(
-                                True if instrumental_regenerated else entry.has_instrumental_variants
-                            ),
-                        ),
-                    ),
-                )
-            except Exception as error:
-                if (
-                    sync_error := self._build_fetch_sync_error(
-                        error,
-                        stage='manifest_write',
-                        track_id=track_id,
-                        touched_keys=touched_keys,
-                        manifest_key=manifest_key,
-                        note_prefix='Fetch manifest write error',
-                    )
-                ) is None:
-                    raise
-                raise sync_error from error
-
-        return FetchedVariants(
-            track_id=entry.id,
-            artists=entry.artists,
-            title=entry.title,
-            cover=FileBytes(data=cover_bytes, extension=Extension.JPG),
-            variants=variants,
-            instrumental_variants=instrumental_variants,
-        )
 
     @staticmethod
     def track_identity_to_string(group: TrackGroup, track_id: TrackId) -> str:

@@ -581,6 +581,113 @@ class ClipStore:
 
         return clips_by_sub_group
 
+    async def fetch(
+        self,
+        group: ClipGroup,
+        sub_group: ClipSubGroup,
+        *,
+        clip_ids: Sequence[ClipId] | None = None,
+        audio_normalization: AudioNormalization | None = None,
+    ) -> AsyncIterator[tuple[FetchedClip, ...]]:
+        """Fetch clips for a clip sub-group in preserved batch order.
+
+        The iterator yields one immutable tuple snapshot per stored batch.
+        Batches are ordered by increasing `batch`, and clips inside each
+        batch are ordered by increasing `order`. When `clip_ids` is provided,
+        validation and resolution are strictly local to the provided `(clip_group,
+        clip_sub_group)`. No cross-group or cross-subgroup lookup is
+        performed. Unknown ids are ids not present in the manifest of the
+        provided `clip_group`.
+
+        Validation precedence for `clip_ids` is:
+        1. Duplicate ids.
+        2. Ids missing from the clip-group manifest.
+        3. Ids not present in the requested subgroup.
+
+        Filtered results preserve the subgroup's canonical current manifest
+        order.
+
+        Returned `FetchedClip.file` values are always MP4, for both raw
+        fetches and audio-normalized fetches.
+
+        Raises:
+            ClipGroupNotFoundError: If the requested logical clip group has no matching clips.
+            DuplicateClipIdsError: If `clip_ids` contains duplicates.
+            ManifestCorruptedError: If the clip-group manifest exists but is malformed.
+            UnknownClipsError: If `clip_ids` contains ids missing from the provided clip-group manifest.
+            ClipIdsNotInSubGroupError: If `clip_ids` contains ids outside the requested subgroup.
+        """
+        clip_group_prefix = self._clip_group_prefix(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+        )
+        try:
+            manifest = await self._load_manifest_for_read(clip_group_prefix)
+        except S3ObjectNotFoundError as error:
+            raise ClipGroupNotFoundError(
+                universe=group.universe,
+                year=group.year,
+                season=group.season,
+                sub_season=None,
+                scope=None,
+            ) from error
+
+        matching_entries = self._sorted_sub_group_entries(manifest, sub_group)
+        if clip_ids is None:
+            if not matching_entries:
+                raise ClipGroupNotFoundError(
+                    universe=group.universe,
+                    year=group.year,
+                    season=group.season,
+                    sub_season=sub_group.sub_season,
+                    scope=sub_group.scope,
+                )
+        else:
+            if len(set(clip_ids)) != len(clip_ids):
+                raise DuplicateClipIdsError(clip_ids=clip_ids)
+
+            manifest_ids = {entry.id for entry in manifest}
+            unknown_ids = [clip_id for clip_id in clip_ids if clip_id not in manifest_ids]
+            if unknown_ids:
+                raise UnknownClipsError(clip_ids=unknown_ids)
+
+            matching_ids = {entry.id for entry in matching_entries}
+            non_matching_ids = [clip_id for clip_id in clip_ids if clip_id not in matching_ids]
+            if non_matching_ids:
+                raise ClipIdsNotInSubGroupError(clip_ids=non_matching_ids)
+
+            requested_ids = set(clip_ids)
+            # Output always follows current manifest ordering after any
+            # compaction; input `clip_ids` order does not affect it.
+            matching_entries = [entry for entry in matching_entries if entry.id in requested_ids]
+
+        # `groupby()` only forms correct batch groups because entries are
+        # sorted by `(batch, order)` immediately above.
+        for _, batch_entries in itertools.groupby(matching_entries, key=lambda entry: entry.batch):
+            batch_entries_list = list(batch_entries)
+            if audio_normalization is None:
+                clip_batch: list[FetchedClip] = []
+                for entry in batch_entries_list:
+                    clip_key = self._clip_key(clip_group_prefix, entry.id)
+                    clip_bytes = await self._s3_client.get_bytes(clip_key)
+                    clip_batch.append(
+                        FetchedClip(
+                            id=entry.id,
+                            file=FileBytes(data=clip_bytes, extension=Extension.MP4),
+                        )
+                    )
+                yield tuple(clip_batch)
+                continue
+
+            clip_batch, manifest = await self._fetch_normalized_batch(
+                clip_group_prefix,
+                manifest,
+                batch_entries_list,
+                audio_normalization=audio_normalization,
+            )
+            yield tuple(clip_batch)
+
     async def store(
         self,
         group: ClipGroup,
@@ -707,236 +814,6 @@ class ClipStore:
             stored_count=len(new_entries),
             duplicate_count=duplicate_count,
             clip_ids=tuple(entry.id for entry, _ in new_entries),
-        )
-
-    async def fetch(
-        self,
-        group: ClipGroup,
-        sub_group: ClipSubGroup,
-        *,
-        clip_ids: Sequence[ClipId] | None = None,
-        audio_normalization: AudioNormalization | None = None,
-    ) -> AsyncIterator[tuple[FetchedClip, ...]]:
-        """Fetch clips for a clip sub-group in preserved batch order.
-
-        The iterator yields one immutable tuple snapshot per stored batch.
-        Batches are ordered by increasing `batch`, and clips inside each
-        batch are ordered by increasing `order`. When `clip_ids` is provided,
-        validation and resolution are strictly local to the provided `(clip_group,
-        clip_sub_group)`. No cross-group or cross-subgroup lookup is
-        performed. Unknown ids are ids not present in the manifest of the
-        provided `clip_group`.
-
-        Validation precedence for `clip_ids` is:
-        1. Duplicate ids.
-        2. Ids missing from the clip-group manifest.
-        3. Ids not present in the requested subgroup.
-
-        Filtered results preserve the subgroup's canonical current manifest
-        order.
-
-        Returned `FetchedClip.file` values are always MP4, for both raw
-        fetches and audio-normalized fetches.
-
-        Raises:
-            ClipGroupNotFoundError: If the requested logical clip group has no matching clips.
-            DuplicateClipIdsError: If `clip_ids` contains duplicates.
-            ManifestCorruptedError: If the clip-group manifest exists but is malformed.
-            UnknownClipsError: If `clip_ids` contains ids missing from the provided clip-group manifest.
-            ClipIdsNotInSubGroupError: If `clip_ids` contains ids outside the requested subgroup.
-        """
-        clip_group_prefix = self._clip_group_prefix(
-            universe=group.universe,
-            year=group.year,
-            season=group.season,
-        )
-        try:
-            manifest = await self._load_manifest_for_read(clip_group_prefix)
-        except S3ObjectNotFoundError as error:
-            raise ClipGroupNotFoundError(
-                universe=group.universe,
-                year=group.year,
-                season=group.season,
-                sub_season=None,
-                scope=None,
-            ) from error
-
-        matching_entries = self._sorted_sub_group_entries(manifest, sub_group)
-        if clip_ids is None:
-            if not matching_entries:
-                raise ClipGroupNotFoundError(
-                    universe=group.universe,
-                    year=group.year,
-                    season=group.season,
-                    sub_season=sub_group.sub_season,
-                    scope=sub_group.scope,
-                )
-        else:
-            if len(set(clip_ids)) != len(clip_ids):
-                raise DuplicateClipIdsError(clip_ids=clip_ids)
-
-            manifest_ids = {entry.id for entry in manifest}
-            unknown_ids = [clip_id for clip_id in clip_ids if clip_id not in manifest_ids]
-            if unknown_ids:
-                raise UnknownClipsError(clip_ids=unknown_ids)
-
-            matching_ids = {entry.id for entry in matching_entries}
-            non_matching_ids = [clip_id for clip_id in clip_ids if clip_id not in matching_ids]
-            if non_matching_ids:
-                raise ClipIdsNotInSubGroupError(clip_ids=non_matching_ids)
-
-            requested_ids = set(clip_ids)
-            # Output always follows current manifest ordering after any
-            # compaction; input `clip_ids` order does not affect it.
-            matching_entries = [entry for entry in matching_entries if entry.id in requested_ids]
-
-        # `groupby()` only forms correct batch groups because entries are
-        # sorted by `(batch, order)` immediately above.
-        for _, batch_entries in itertools.groupby(matching_entries, key=lambda entry: entry.batch):
-            batch_entries_list = list(batch_entries)
-            if audio_normalization is None:
-                clip_batch: list[FetchedClip] = []
-                for entry in batch_entries_list:
-                    clip_key = self._clip_key(clip_group_prefix, entry.id)
-                    clip_bytes = await self._s3_client.get_bytes(clip_key)
-                    clip_batch.append(
-                        FetchedClip(
-                            id=entry.id,
-                            file=FileBytes(data=clip_bytes, extension=Extension.MP4),
-                        )
-                    )
-                yield tuple(clip_batch)
-                continue
-
-            clip_batch, manifest = await self._fetch_normalized_batch(
-                clip_group_prefix,
-                manifest,
-                batch_entries_list,
-                audio_normalization=audio_normalization,
-            )
-            yield tuple(clip_batch)
-
-    async def reconcile(
-        self,
-        group: ClipGroup,
-        sub_group: ClipSubGroup,
-        *,
-        clip_id_batches: Sequence[Sequence[ClipId]],
-    ) -> ReconcileResult:
-        """Replace one sub-group with the provided clip-id manifest state.
-
-        Reconcile is manifest-authoritative for the target `ClipSubGroup`.
-        The provided `clip_id_batches` define the complete desired subgroup
-        state: their order becomes canonical, omitted clips are removed from
-        that subgroup, and clips may be moved in from other sub-groups within
-        the same `ClipGroup`. The operation never hashes, uploads, downloads,
-        or rewrites clip bytes. It only rewrites the manifest and deletes clip
-        objects that become unreachable from the final manifest.
-
-        The manifest remains authoritative for normalized-cache tracking.
-        Untracked normalized objects are treated as stale cache, not storage state.
-
-        Raises:
-            ValueError: If `clip_id_batches` is empty, contains empty batches, or otherwise contains no clip ids.
-            DuplicateClipIdsError: If the provided clip ids contain duplicates.
-            UnknownClipsError: If a parsed clip id is not present in the provided clip group's manifest.
-            ClipGroupNotFoundError: If the requested clip group has no manifest.
-            ManifestCorruptedError: If the clip-group manifest exists but is malformed.
-            ReconcileDeleteError: If one or more removed clip objects cannot be deleted after the manifest rewrite.
-        """
-        clip_ids = self._flatten_clip_id_batches(
-            clip_id_batches,
-            operation='reconcile()',
-        )
-        if len(set(clip_ids)) != len(clip_ids):
-            raise DuplicateClipIdsError(clip_ids=clip_ids)
-
-        clip_group_prefix = self._clip_group_prefix(
-            universe=group.universe,
-            year=group.year,
-            season=group.season,
-        )
-        try:
-            manifest = await self._load_manifest_for_read(clip_group_prefix)
-        except S3ObjectNotFoundError as error:
-            raise ClipGroupNotFoundError(
-                universe=group.universe,
-                year=group.year,
-                season=group.season,
-                sub_season=None,
-                scope=None,
-            ) from error
-
-        entries_by_id = {entry.id: entry for entry in manifest}
-        unknown_ids = [clip_id for clip_id in clip_ids if clip_id not in entries_by_id]
-        if unknown_ids:
-            raise UnknownClipsError(clip_ids=unknown_ids)
-
-        existing_target_entries = [
-            entry for entry in manifest if entry.scope is sub_group.scope and entry.sub_season is sub_group.sub_season
-        ]
-        old_subgroup_ids = {entry.id for entry in existing_target_entries}
-
-        new_entries: list[ManifestEntry] = []
-        new_subgroup_ids: set[ClipId] = set()
-        for batch_index, clip_id_batch in enumerate(clip_id_batches, start=1):
-            for order_index, clip_id in enumerate(clip_id_batch, start=1):
-                existing_entry = entries_by_id[clip_id]
-                new_entries.append(
-                    ManifestEntry(
-                        id=clip_id,
-                        video_hash=existing_entry.video_hash,
-                        audio_normalization=existing_entry.audio_normalization,
-                        sub_season=sub_group.sub_season,
-                        scope=sub_group.scope,
-                        batch=batch_index,
-                        order=order_index,
-                    )
-                )
-                new_subgroup_ids.add(clip_id)
-
-        rewritten_entries: list[ManifestEntry] = []
-        for entry in manifest:
-            if entry.scope is sub_group.scope and entry.sub_season is sub_group.sub_season:
-                continue
-            if entry.id in new_subgroup_ids:
-                continue
-            rewritten_entries.append(entry)
-
-        rewritten_entries.extend(new_entries)
-        rewritten_manifest = Manifest(rewritten_entries)
-        await self._write_manifest_and_update_cache(
-            clip_group_prefix=clip_group_prefix,
-            manifest=rewritten_manifest,
-        )
-
-        # The manifest is authoritative, so cache must track the rewritten
-        # manifest even if deleting removed clip objects fails afterwards.
-
-        removed_ids = old_subgroup_ids - new_subgroup_ids
-        failed_keys: list[Key] = []
-        for removed_id in removed_ids:
-            removed_entry = entries_by_id[removed_id]
-            raw_clip_key = self._clip_key(clip_group_prefix, removed_id)
-            try:
-                await self._s3_client.delete_key(raw_clip_key)
-            except Exception as exc:
-                logger.error('Failed to delete key {}: {}', raw_clip_key, exc)
-                failed_keys.append(raw_clip_key)
-            if removed_entry.audio_normalization is not None:
-                normalized_clip_key = self._normalized_clip_key(clip_group_prefix, removed_id)
-                try:
-                    await self._s3_client.delete_key(normalized_clip_key)
-                except Exception as exc:
-                    logger.error('Failed to delete key {}: {}', normalized_clip_key, exc)
-                    failed_keys.append(normalized_clip_key)
-
-        if failed_keys:
-            raise ReconcileDeleteError(failed_keys=failed_keys)
-
-        return ReconcileResult(
-            updated=len(new_entries),
-            removed=len(removed_ids),
         )
 
     async def compact(
@@ -1161,6 +1038,129 @@ class ClipStore:
         await self._write_manifest_and_update_cache(
             clip_group_prefix=clip_group_prefix,
             manifest=rewritten_manifest,
+        )
+
+    async def reconcile(
+        self,
+        group: ClipGroup,
+        sub_group: ClipSubGroup,
+        *,
+        clip_id_batches: Sequence[Sequence[ClipId]],
+    ) -> ReconcileResult:
+        """Replace one sub-group with the provided clip-id manifest state.
+
+        Reconcile is manifest-authoritative for the target `ClipSubGroup`.
+        The provided `clip_id_batches` define the complete desired subgroup
+        state: their order becomes canonical, omitted clips are removed from
+        that subgroup, and clips may be moved in from other sub-groups within
+        the same `ClipGroup`. The operation never hashes, uploads, downloads,
+        or rewrites clip bytes. It only rewrites the manifest and deletes clip
+        objects that become unreachable from the final manifest.
+
+        The manifest remains authoritative for normalized-cache tracking.
+        Untracked normalized objects are treated as stale cache, not storage state.
+
+        Raises:
+            ValueError: If `clip_id_batches` is empty, contains empty batches, or otherwise contains no clip ids.
+            DuplicateClipIdsError: If the provided clip ids contain duplicates.
+            UnknownClipsError: If a parsed clip id is not present in the provided clip group's manifest.
+            ClipGroupNotFoundError: If the requested clip group has no manifest.
+            ManifestCorruptedError: If the clip-group manifest exists but is malformed.
+            ReconcileDeleteError: If one or more removed clip objects cannot be deleted after the manifest rewrite.
+        """
+        clip_ids = self._flatten_clip_id_batches(
+            clip_id_batches,
+            operation='reconcile()',
+        )
+        if len(set(clip_ids)) != len(clip_ids):
+            raise DuplicateClipIdsError(clip_ids=clip_ids)
+
+        clip_group_prefix = self._clip_group_prefix(
+            universe=group.universe,
+            year=group.year,
+            season=group.season,
+        )
+        try:
+            manifest = await self._load_manifest_for_read(clip_group_prefix)
+        except S3ObjectNotFoundError as error:
+            raise ClipGroupNotFoundError(
+                universe=group.universe,
+                year=group.year,
+                season=group.season,
+                sub_season=None,
+                scope=None,
+            ) from error
+
+        entries_by_id = {entry.id: entry for entry in manifest}
+        unknown_ids = [clip_id for clip_id in clip_ids if clip_id not in entries_by_id]
+        if unknown_ids:
+            raise UnknownClipsError(clip_ids=unknown_ids)
+
+        existing_target_entries = [
+            entry for entry in manifest if entry.scope is sub_group.scope and entry.sub_season is sub_group.sub_season
+        ]
+        old_subgroup_ids = {entry.id for entry in existing_target_entries}
+
+        new_entries: list[ManifestEntry] = []
+        new_subgroup_ids: set[ClipId] = set()
+        for batch_index, clip_id_batch in enumerate(clip_id_batches, start=1):
+            for order_index, clip_id in enumerate(clip_id_batch, start=1):
+                existing_entry = entries_by_id[clip_id]
+                new_entries.append(
+                    ManifestEntry(
+                        id=clip_id,
+                        video_hash=existing_entry.video_hash,
+                        audio_normalization=existing_entry.audio_normalization,
+                        sub_season=sub_group.sub_season,
+                        scope=sub_group.scope,
+                        batch=batch_index,
+                        order=order_index,
+                    )
+                )
+                new_subgroup_ids.add(clip_id)
+
+        rewritten_entries: list[ManifestEntry] = []
+        for entry in manifest:
+            if entry.scope is sub_group.scope and entry.sub_season is sub_group.sub_season:
+                continue
+            if entry.id in new_subgroup_ids:
+                continue
+            rewritten_entries.append(entry)
+
+        rewritten_entries.extend(new_entries)
+        rewritten_manifest = Manifest(rewritten_entries)
+        await self._write_manifest_and_update_cache(
+            clip_group_prefix=clip_group_prefix,
+            manifest=rewritten_manifest,
+        )
+
+        # The manifest is authoritative, so cache must track the rewritten
+        # manifest even if deleting removed clip objects fails afterwards.
+
+        removed_ids = old_subgroup_ids - new_subgroup_ids
+        failed_keys: list[Key] = []
+        for removed_id in removed_ids:
+            removed_entry = entries_by_id[removed_id]
+            raw_clip_key = self._clip_key(clip_group_prefix, removed_id)
+            try:
+                await self._s3_client.delete_key(raw_clip_key)
+            except Exception as exc:
+                logger.error('Failed to delete key {}: {}', raw_clip_key, exc)
+                failed_keys.append(raw_clip_key)
+            if removed_entry.audio_normalization is not None:
+                normalized_clip_key = self._normalized_clip_key(clip_group_prefix, removed_id)
+                try:
+                    await self._s3_client.delete_key(normalized_clip_key)
+                except Exception as exc:
+                    logger.error('Failed to delete key {}: {}', normalized_clip_key, exc)
+                    failed_keys.append(normalized_clip_key)
+
+        if failed_keys:
+            raise ReconcileDeleteError(failed_keys=failed_keys)
+
+        return ReconcileResult(
+            updated=len(new_entries),
+            removed=len(removed_ids),
         )
 
     async def remove(
