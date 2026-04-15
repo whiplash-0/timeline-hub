@@ -42,6 +42,7 @@ from timeline_hub.handlers.clips.common import (
     three_row_keyboard,
     validate_flow_state,
 )
+from timeline_hub.handlers.clips.delivery import audio_normalization_from_settings, send_fetched_clip_batches
 from timeline_hub.handlers.clips.flow import (
     FlowMenuDefinition,
     flow_selection_labels,
@@ -56,12 +57,8 @@ from timeline_hub.handlers.clips.flow import (
     validate_menu_flow_state,
     year_option_universe,
 )
-from timeline_hub.handlers.clips.retrieve import (
-    _send_fetched_clip_batches,
-    should_normalize_audio,
-)
+from timeline_hub.handlers.clips.route_planning import RouteBatch, plan_route_batches
 from timeline_hub.services.clip_store import (
-    AudioNormalization,
     ClipGroup,
     ClipId,
     ClipStore,
@@ -121,12 +118,6 @@ class ReorderClipFlow(StatesGroup):
 class ReorderCallbackData(CallbackData, prefix='clip_reorder'):
     action: MenuAction
     value: str
-
-
-@dataclass(slots=True)
-class _RouteBatch:
-    clip_group: ClipGroup
-    messages: list[Message]
 
 
 @dataclass(slots=True)
@@ -356,7 +347,7 @@ async def on_intake_action(
             # Route is a single-shot action: flush at entry, validate after flush,
             # never restore the buffer on failure. This is intentional to keep the
             # UI stateless and simple; users must resend clips if validation fails.
-            route_batches, error_text = _plan_route_batches(
+            route_batches, error_text = plan_route_batches(
                 services.chat_message_buffer.flush_grouped(message.chat.id),
                 settings=settings,
             )
@@ -841,7 +832,7 @@ async def _on_store_select(
                         raise
 
                 if flow is _PRODUCE_FLOW and result.stored_count > 0:
-                    await _send_fetched_clip_batches(
+                    await send_fetched_clip_batches(
                         bot=bot,
                         chat_id=message.chat.id,
                         group=clip_group,
@@ -850,14 +841,7 @@ async def _on_store_select(
                             clip_group,
                             clip_sub_group,
                             clip_ids=result.clip_ids,
-                            audio_normalization=(
-                                AudioNormalization(
-                                    loudness=settings.normalization_loudness,
-                                    bitrate=settings.normalization_bitrate,
-                                )
-                                if should_normalize_audio(settings=settings)
-                                else None
-                            ),
+                            audio_normalization=audio_normalization_from_settings(settings=settings),
                         ),
                     )
                     await bot.send_message(chat_id=message.chat.id, text='Done')
@@ -1147,81 +1131,11 @@ async def _store_buffered_clips(
     return result
 
 
-def _plan_route_batches(
-    message_groups: Sequence[MessageGroup],
-    *,
-    settings: Settings,
-) -> tuple[list[_RouteBatch], str | None]:
-    batches: list[_RouteBatch] = []
-    current_route: ClipGroup | None = None
-    today = date.today()
-    allowed_years = set(
-        year_option_universe(
-            current_year=today.year,
-            min_year=settings.min_clip_year,
-        )
-    )
-
-    for message_group in message_groups:
-        for message in message_group:
-            if message.video is None:
-                if message.text is None:
-                    continue
-
-                parsed_route = _parse_and_validate_route(
-                    message.text,
-                    today=today,
-                    allowed_years=allowed_years,
-                )
-                if parsed_route is None:
-                    continue
-                current_route = parsed_route
-                continue
-
-            route_text = message.caption if message.caption is not None else message.text
-            if route_text is None:
-                if current_route is None:
-                    return [], 'Missing route text'
-                next_route = current_route
-            else:
-                next_route = _parse_and_validate_route(
-                    route_text,
-                    today=today,
-                    allowed_years=allowed_years,
-                )
-                if next_route is None:
-                    return [], 'Invalid route text'
-
-            if not batches or batches[-1].clip_group != next_route:
-                batches.append(_RouteBatch(clip_group=next_route, messages=[message]))
-            else:
-                batches[-1].messages.append(message)
-            current_route = next_route
-
-    return batches, None
-
-
-def _parse_and_validate_route(
-    text: str,
-    *,
-    today: date,
-    allowed_years: set[int],
-) -> ClipGroup | None:
-    parsed_route = parse_route_text(text)
-    if parsed_route is None:
-        return None
-    if parsed_route.year not in allowed_years:
-        return None
-    if parsed_route.season not in store_allowed_seasons(year=parsed_route.year, today=today):
-        return None
-    return parsed_route
-
-
 async def _store_route_batches(
     *,
     bot: Bot,
     services: Services,
-    route_batches: Sequence[_RouteBatch],
+    route_batches: Sequence[RouteBatch],
     on_batch_stored: Callable[[Sequence[ClipGroup]], Awaitable[None]] | None = None,
 ) -> _RouteResult:
     result = StoreResult(stored_count=0, duplicate_count=0)
@@ -1338,33 +1252,6 @@ def _store_year_options(*, current_year: int, min_year: int) -> list[int]:
 
 def _store_season_options(*, year: int, today: date) -> list[Season]:
     return store_allowed_seasons(year=year, today=today)
-
-
-def parse_route_text(text: str) -> ClipGroup | None:
-    normalized = text.strip()
-    if len(normalized) != 4:
-        return None
-
-    universe_text = normalized[0].lower()
-    year_suffix = normalized[1:3]
-    season_text = normalized[3]
-
-    if not year_suffix.isdigit() or not season_text.isdigit():
-        return None
-
-    try:
-        season = Season(int(season_text))
-    except ValueError:
-        return None
-
-    if universe_text == 'w':
-        universe = Universe.WEST
-    elif universe_text == 'e':
-        universe = Universe.EAST
-    else:
-        return None
-
-    return ClipGroup(universe=universe, year=2000 + int(year_suffix), season=season)
 
 
 def _buffered_video_messages(message_groups: Sequence[MessageGroup]) -> list[Message]:

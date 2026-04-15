@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import Sequence
 from datetime import date
 from enum import StrEnum, auto
 
@@ -6,7 +6,7 @@ from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InputMediaVideo, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 
 from timeline_hub.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
@@ -28,6 +28,7 @@ from timeline_hub.handlers.clips.common import (
     stacked_keyboard,
     width_reserved_text,
 )
+from timeline_hub.handlers.clips.delivery import audio_normalization_from_settings, send_fetched_clip_batches
 from timeline_hub.handlers.clips.flow import (
     FlowMenuDefinition,
     available_group_seasons,
@@ -48,12 +49,9 @@ from timeline_hub.handlers.clips.flow import (
     year_option_universe,
 )
 from timeline_hub.services.clip_store import (
-    AudioNormalization,
     ClipGroup,
     ClipGroupNotFoundError,
-    ClipStore,
     ClipSubGroup,
-    FetchedClip,
     Scope,
     Season,
     SubSeason,
@@ -61,7 +59,7 @@ from timeline_hub.services.clip_store import (
 )
 from timeline_hub.services.container import Services
 from timeline_hub.settings import Settings
-from timeline_hub.types import ChatId, Extension
+from timeline_hub.types import ChatId
 
 router = Router()
 
@@ -657,13 +655,13 @@ async def _send_retrieve_scopes(
     settings: Settings,
     normalize_audio: bool,
 ) -> None:
-    audio_normalization = _audio_normalization(settings=settings) if normalize_audio else None
+    audio_normalization = audio_normalization_from_settings(settings=settings) if normalize_audio else None
 
     for index, scope in enumerate(scopes):
         if index > 0:
             await bot.send_message(chat_id=chat_id, text='.')
 
-        await _send_fetched_clip_batches(
+        await send_fetched_clip_batches(
             bot=bot,
             chat_id=chat_id,
             group=clip_group,
@@ -676,59 +674,6 @@ async def _send_retrieve_scopes(
         )
 
     await bot.send_message(chat_id=chat_id, text='Done')
-
-
-async def _send_fetched_clip_batches(
-    *,
-    bot: Bot,
-    chat_id: ChatId,
-    group: ClipGroup,
-    sub_group: ClipSubGroup,
-    clip_batches: AsyncIterator[tuple[FetchedClip, ...]],
-) -> None:
-    async for batch in clip_batches:
-        await _send_stored_clip_batch(
-            bot=bot,
-            chat_id=chat_id,
-            group=group,
-            sub_group=sub_group,
-            clips=batch,
-        )
-
-
-async def _send_stored_clip_batch(
-    *,
-    bot: Bot,
-    chat_id: ChatId,
-    group: ClipGroup,
-    sub_group: ClipSubGroup,
-    clips: Sequence[FetchedClip],
-) -> None:
-    if not clips:
-        raise ValueError('`clips` must not be empty')
-
-    if len(clips) == 1:
-        clip = clips[0]
-        await bot.send_video(
-            chat_id=chat_id,
-            video=BufferedInputFile(clip.file.data, filename=_fetched_clip_filename(group, sub_group, clip.id)),
-        )
-        return
-
-    await bot.send_media_group(
-        chat_id=chat_id,
-        media=[
-            InputMediaVideo(
-                media=BufferedInputFile(clip.file.data, filename=_fetched_clip_filename(group, sub_group, clip.id)),
-            )
-            for clip in clips
-        ],
-    )
-
-
-def _fetched_clip_filename(group: ClipGroup, sub_group: ClipSubGroup, clip_id: str) -> str:
-    identity = ClipStore.clip_identity_to_string(group, sub_group, clip_id)
-    return f'{identity}{Extension.MP4.suffix}'
 
 
 async def _retrieve_sub_groups(
@@ -792,15 +737,3 @@ def _flow_for_mode(mode: object) -> FlowMenuDefinition | None:
 
 def _normalizes_audio(flow: FlowMenuDefinition) -> bool:
     return flow is _GET_FLOW
-
-
-def _audio_normalization(*, settings: Settings) -> AudioNormalization:
-    return AudioNormalization(
-        loudness=settings.normalization_loudness,
-        bitrate=settings.normalization_bitrate,
-    )
-
-
-def should_normalize_audio(*, settings: Settings) -> bool:
-    """Return whether audio normalization should be applied when sending clips."""
-    return _normalizes_audio(_GET_FLOW)

@@ -7,8 +7,10 @@ import pytest
 from aiogram.types import InlineKeyboardButton
 from aiogram.utils.formatting import Bold, Text
 
+import timeline_hub.handlers.clips.delivery as delivery_module
 import timeline_hub.handlers.clips.ingest as intake_module
 import timeline_hub.handlers.clips.retrieve as retrieve_module
+import timeline_hub.handlers.clips.route_planning as route_planning_module
 from timeline_hub.handlers.clips.common import (
     ALL_SCOPES_CALLBACK_VALUE,
     DUMMY_BUTTON_TEXT,
@@ -24,6 +26,7 @@ from timeline_hub.handlers.clips.common import (
     selected_text,
     selection_labels,
 )
+from timeline_hub.handlers.clips.delivery import send_fetched_clip_batch
 from timeline_hub.handlers.clips.ingest import (
     IntakeAction,
     IntakeCallbackData,
@@ -40,14 +43,12 @@ from timeline_hub.handlers.clips.ingest import (
     on_intake_action,
     on_intake_menu,
     on_reorder_menu,
-    parse_route_text,
 )
 from timeline_hub.handlers.clips.retrieve import (
     RetrieveCallbackData,
     RetrieveEntryAction,
     RetrieveEntryCallbackData,
     _send_retrieve_scopes,
-    _send_stored_clip_batch,
     _show_retrieve_scope_menu,
     _show_retrieve_season_menu,
     _show_retrieve_sub_season_menu,
@@ -56,6 +57,7 @@ from timeline_hub.handlers.clips.retrieve import (
     on_retrieve_entry,
     on_retrieve_menu,
 )
+from timeline_hub.handlers.clips.route_planning import parse_route_text
 from timeline_hub.handlers.router import on_dummy_button
 from timeline_hub.services.clip_store import (
     AudioNormalization,
@@ -2087,7 +2089,7 @@ async def test_route_action_rejects_future_year_before_execution(monkeypatch: py
         def today(cls) -> '_FixedDate':
             return cls(2026, 6, 15)
 
-    monkeypatch.setattr(intake_module, 'date', _FixedDate)
+    monkeypatch.setattr(route_planning_module, 'date', _FixedDate)
 
     message = _fake_message(text='Select action:', chat_id=77, message_id=76)
     callback = _fake_callback(message)
@@ -2133,7 +2135,7 @@ async def test_route_action_ignores_semantically_invalid_pre_clip_route_text(
         def today(cls) -> '_FixedDate':
             return cls(2026, 6, 15)
 
-    monkeypatch.setattr(intake_module, 'date', _FixedDate)
+    monkeypatch.setattr(route_planning_module, 'date', _FixedDate)
 
     message = _fake_message(text='Select action:', chat_id=77, message_id=77)
     callback = _fake_callback(message)
@@ -2212,7 +2214,7 @@ async def test_route_action_rejects_season_not_allowed_for_current_year_before_e
         def today(cls) -> '_FixedDate':
             return cls(2026, 6, 15)
 
-    monkeypatch.setattr(intake_module, 'date', _FixedDate)
+    monkeypatch.setattr(route_planning_module, 'date', _FixedDate)
 
     message = _fake_message(text='Select action:', chat_id=77, message_id=78)
     callback = _fake_callback(message)
@@ -3336,8 +3338,8 @@ async def test_produce_scope_selection_stores_then_fetches_only_new_subset_via_s
     ]
     bot.download_file.side_effect = [BytesIO(b'one'), BytesIO(b'two'), BytesIO(b'three')]
 
-    shared_helper = AsyncMock(side_effect=retrieve_module._send_fetched_clip_batches)
-    monkeypatch.setattr(intake_module, '_send_fetched_clip_batches', shared_helper)
+    shared_helper = AsyncMock(side_effect=delivery_module.send_fetched_clip_batches)
+    monkeypatch.setattr(intake_module, 'send_fetched_clip_batches', shared_helper)
 
     await on_intake_menu(
         callback,
@@ -4053,12 +4055,12 @@ async def test_reconcile_entry_surfaces_parse_errors(
 
 
 @pytest.mark.asyncio
-async def test_send_stored_clip_batch_preserves_filename() -> None:
+async def test_send_fetched_clip_batch_preserves_filename() -> None:
     bot = AsyncMock()
     clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
     clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
 
-    await _send_stored_clip_batch(
+    await send_fetched_clip_batch(
         bot=bot,
         chat_id=5,
         group=clip_group,
@@ -4075,12 +4077,12 @@ async def test_send_stored_clip_batch_preserves_filename() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_stored_clip_batch_sends_single_clip_as_video() -> None:
+async def test_send_fetched_clip_batch_sends_single_clip_as_video() -> None:
     bot = AsyncMock()
     clip_group = ClipGroup(universe=Universe.WEST, year=2025, season=Season.S1)
     clip_sub_group = ClipSubGroup(sub_season=SubSeason.NONE, scope=Scope.COLLECTION)
 
-    await _send_stored_clip_batch(
+    await send_fetched_clip_batch(
         bot=bot,
         chat_id=5,
         group=clip_group,
