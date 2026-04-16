@@ -161,16 +161,11 @@ async def on_buffered_clip_message(
     services.chat_message_buffer.append(message, chat_id=chat_id)
 
     async def send_clip_action_selection() -> None:
-        kwargs = _intake_action_menu_kwargs(
+        await try_dispatch_clip_intake(
+            message=message,
             services=services,
-            chat_id=chat_id,
-            message_width=settings.message_width,
+            settings=settings,
         )
-        if kwargs is None:
-            services.chat_message_buffer.flush(chat_id)
-            await message.answer(text='No clips received')
-            return
-        await message.answer(**kwargs)
 
     services.task_scheduler.schedule(
         send_clip_action_selection,
@@ -264,7 +259,7 @@ async def on_intake_action(
             )
 
         case IntakeAction.RECONCILE:
-            if _has_pending_reconcile_videos(
+            if _has_buffered_videos(
                 services=services,
                 chat_id=message.chat.id,
             ):
@@ -1144,7 +1139,7 @@ def _pending_reconcile_clip_id_batches(
     return prepare_reconcile_clip_id_batches(services.chat_message_buffer.peek_grouped(chat_id))
 
 
-def _has_pending_reconcile_videos(
+def _has_buffered_videos(
     *,
     services: Services,
     chat_id: ChatId,
@@ -1231,6 +1226,34 @@ def _intake_action_menu_kwargs(
             back_button=_create_intake_action_button(IntakeAction.CANCEL),
         ),
     }
+
+
+async def try_dispatch_clip_intake(
+    *,
+    message: Message,
+    services: Services,
+    settings: Settings,
+) -> bool:
+    """Send the clip intake menu if the current buffered batch belongs to clips."""
+    chat_id = message.chat.id
+    if not _has_buffered_videos(
+        services=services,
+        chat_id=chat_id,
+    ):
+        return False
+
+    kwargs = _intake_action_menu_kwargs(
+        services=services,
+        chat_id=chat_id,
+        message_width=settings.message_width,
+    )
+    if kwargs is None:
+        services.chat_message_buffer.flush(chat_id)
+        await message.answer(text='No clips received')
+        return True
+
+    await message.answer(**kwargs)
+    return True
 
 
 def _route_progress_kwargs(route_groups: Sequence[ClipGroup]) -> dict[str, Any]:

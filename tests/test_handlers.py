@@ -42,6 +42,7 @@ from timeline_hub.handlers.clips.ingest import (
     on_intake_action,
     on_intake_menu,
     on_reorder_menu,
+    try_dispatch_clip_intake,
 )
 from timeline_hub.handlers.clips.reorder_flow import ReorderCallbackData, ReorderClipFlow
 from timeline_hub.handlers.clips.retrieve import (
@@ -656,6 +657,24 @@ async def test_clip_action_selection_includes_store_button() -> None:
         ['Reconcile', 'Produce', 'Compact'],
         ['Cancel'],
     ]
+
+
+@pytest.mark.asyncio
+async def test_try_dispatch_clip_intake_returns_false_without_videos() -> None:
+    message = _fake_message(chat_id=42, message_id=1, text='note')
+    buffer = ChatMessageBuffer()
+    buffer.append(message, chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    handled = await try_dispatch_clip_intake(
+        message=message,
+        services=services,
+        settings=_settings(),
+    )
+
+    assert handled is False
+    message.answer.assert_not_awaited()
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1]
 
 
 def test_intake_action_keyboard_uses_right_to_left_columns() -> None:
