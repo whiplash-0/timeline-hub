@@ -59,7 +59,19 @@ from timeline_hub.handlers.clips.retrieve import (
 )
 from timeline_hub.handlers.clips.route_planning import parse_route_text
 from timeline_hub.handlers.intake import on_buffered_relevant_message
-from timeline_hub.handlers.router import on_dummy_button
+from timeline_hub.handlers.router import on_dummy_button, on_start_send_menu
+from timeline_hub.handlers.tracks.retrieve import (
+    RetrieveEntryAction as TracksRetrieveEntryAction,
+)
+from timeline_hub.handlers.tracks.retrieve import (
+    RetrieveEntryCallbackData as TracksRetrieveEntryCallbackData,
+)
+from timeline_hub.handlers.tracks.retrieve import (
+    on_retrieve_entry as on_tracks_retrieve_entry,
+)
+from timeline_hub.handlers.tracks.retrieve import (
+    on_tracks,
+)
 from timeline_hub.services.clip_store import (
     AudioNormalization,
     ClipGroup,
@@ -321,6 +333,10 @@ def _assert_three_rows(reply_markup) -> None:
     assert len(reply_markup.inline_keyboard) == 3
 
 
+def _reply_keyboard_rows(reply_markup) -> list[list[str]]:
+    return [[button.text for button in row] for row in reply_markup.keyboard]
+
+
 def _assert_no_dummy_buttons(reply_markup) -> None:
     assert all(button.text != DUMMY_BUTTON_TEXT for row in reply_markup.inline_keyboard for button in row)
 
@@ -462,6 +478,20 @@ def test_handlers_package_router_imports_cleanly() -> None:
     assert router is not None
 
 
+@pytest.mark.asyncio
+async def test_on_start_sends_only_clips_entry() -> None:
+    message = _fake_message()
+
+    await on_start_send_menu(message)
+
+    message.answer.assert_awaited_once_with(
+        text='Menu loaded',
+        reply_markup=message.answer.await_args.kwargs['reply_markup'],
+    )
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    assert _reply_keyboard_rows(reply_markup) == [['Clips']]
+
+
 def test_selection_labels_omits_none_sub_season_from_visible_path() -> None:
     assert selection_labels(
         universe=Universe.WEST,
@@ -543,6 +573,27 @@ async def test_on_clips_sends_retrieve_entry_button() -> None:
 
 
 @pytest.mark.asyncio
+async def test_on_tracks_sends_track_entry_button() -> None:
+    message = _fake_message(text='Tracks')
+    state = _FakeState()
+    settings = _settings()
+
+    await on_tracks(message, state, settings)
+
+    message.answer.assert_awaited_once()
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_one_line_button_message(
+        text=message.answer.await_args.kwargs['text'],
+        real_line='Select action:',
+        message_width=settings.message_width,
+    )
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], [DUMMY_BUTTON_TEXT], ['Cancel']]
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
 async def test_on_retrieve_entry_edits_to_no_clips_stored_when_empty() -> None:
     message = _fake_message(text='Clips', message_id=10)
     callback = _fake_callback(message)
@@ -592,6 +643,27 @@ async def test_on_retrieve_entry_cancel_removes_buttons_and_shows_selected_text(
         reply_markup=None,
     )
     services.clip_store.list_groups.assert_not_awaited()
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_on_track_retrieve_entry_cancel_removes_buttons_and_shows_selected_text() -> None:
+    message = _fake_message(text='Select action:', message_id=14)
+    callback = _fake_callback(message)
+    state = _FakeState()
+
+    await on_tracks_retrieve_entry(
+        callback,
+        TracksRetrieveEntryCallbackData(action=TracksRetrieveEntryAction.CANCEL),
+        state,
+    )
+
+    callback.answer.assert_awaited_once()
+    message.edit_text.assert_awaited_once_with(
+        **Text('Selected: ', Bold('Cancel')).as_kwargs(),
+        reply_markup=None,
+    )
     assert state.current_state is None
     assert state.clear_count == 1
 

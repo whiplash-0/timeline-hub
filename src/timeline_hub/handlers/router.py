@@ -6,9 +6,10 @@ from aiogram.types import CallbackQuery, ErrorEvent, KeyboardButton, Message, Re
 from loguru import logger
 
 from timeline_hub.handlers.clips.common import DUMMY_CALLBACK_VALUE
-from timeline_hub.handlers.clips.ingest import router as ingest_router
-from timeline_hub.handlers.clips.retrieve import router as retrieve_router
+from timeline_hub.handlers.clips.ingest import router as clips_ingest_router
+from timeline_hub.handlers.clips.retrieve import router as clips_retrieve_router
 from timeline_hub.handlers.intake import router as intake_router
+from timeline_hub.handlers.tracks.retrieve import router as tracks_retrieve_router
 
 router = Router()
 
@@ -39,6 +40,7 @@ async def on_start_send_menu(message: Message) -> None:
     )
 
 
-router.include_router(retrieve_router)
+router.include_router(clips_retrieve_router)
+router.include_router(tracks_retrieve_router)
 router.include_router(intake_router)
-router.include_router(ingest_router)
+router.include_router(clips_ingest_router)
