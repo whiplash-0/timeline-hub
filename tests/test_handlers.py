@@ -746,17 +746,27 @@ async def test_clip_action_selection_includes_store_button() -> None:
 
 
 @pytest.mark.asyncio
-async def test_audio_only_buffered_batch_shows_track_menu() -> None:
+async def test_valid_photo_audio_pairs_dispatch_to_track_menu() -> None:
     scheduler = _FakeScheduler()
     buffer = ChatMessageBuffer()
     services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
     settings = _settings()
+    first_message = _fake_message(chat_id=42, message_id=1, photo=[object()], caption='Artist\nTitle')
+    second_message = _fake_message(
+        chat_id=42,
+        message_id=2,
+        audio=_fake_audio(file_id='audio-1', file_name='one.mp3'),
+    )
+    third_message = _fake_message(chat_id=42, message_id=3, photo=[object()], caption='Another Artist\nAnother Title')
     message = _fake_message(
         chat_id=42,
-        message_id=1,
-        audio=_fake_audio(file_id='audio-1', file_name='track.mp3'),
+        message_id=4,
+        audio=_fake_audio(file_id='audio-2', file_name='two.mp3'),
     )
 
+    await on_buffered_relevant_message(first_message, services, settings)
+    await on_buffered_relevant_message(second_message, services, settings)
+    await on_buffered_relevant_message(third_message, services, settings)
     await on_buffered_relevant_message(message, services, settings)
     assert scheduler.job is not None
 
@@ -764,20 +774,59 @@ async def test_audio_only_buffered_batch_shows_track_menu() -> None:
 
     expected = Text(
         'Tracks: ',
-        Bold('1'),
+        Bold('2'),
         '\n',
         create_padding_line(settings.message_width),
         '\n',
         'Select action:',
     ).as_kwargs()
-    _assert_format_kwargs(
-        message.answer.await_args.kwargs,
-        expected,
-    )
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
     assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], [DUMMY_BUTTON_TEXT], ['Cancel']]
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_valid_out_of_order_appended_track_batch_dispatches_in_message_order() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    settings = _settings()
+    first_appended = _fake_message(
+        chat_id=42,
+        message_id=2,
+        audio=_fake_audio(file_id='audio-1', file_name='one.mp3'),
+    )
+    second_appended = _fake_message(chat_id=42, message_id=1, photo=[object()], caption='Artist\nTitle')
+    third_appended = _fake_message(
+        chat_id=42,
+        message_id=4,
+        audio=_fake_audio(file_id='audio-2', file_name='two.mp3'),
+    )
+    message = _fake_message(chat_id=42, message_id=3, photo=[object()], caption='Another Artist\nAnother Title')
+
+    await on_buffered_relevant_message(first_appended, services, settings)
+    await on_buffered_relevant_message(second_appended, services, settings)
+    await on_buffered_relevant_message(third_appended, services, settings)
+    await on_buffered_relevant_message(message, services, settings)
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    expected = Text(
+        'Tracks: ',
+        Bold('2'),
+        '\n',
+        create_padding_line(settings.message_width),
+        '\n',
+        'Select action:',
+    ).as_kwargs()
+    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
+    reply_markup = message.answer.await_args.kwargs['reply_markup']
+    _assert_three_rows(reply_markup)
+    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], [DUMMY_BUTTON_TEXT], ['Cancel']]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [2, 1, 4, 3]
 
 
 @pytest.mark.asyncio
@@ -802,33 +851,77 @@ async def test_mixed_buffered_batch_is_rejected_and_flushed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_multi_audio_buffered_batch_shows_track_menu_with_correct_count() -> None:
+async def test_invalid_track_batch_order_sends_cant_dispatch_input() -> None:
     scheduler = _FakeScheduler()
     buffer = ChatMessageBuffer()
     services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
-    settings = _settings()
     first_message = _fake_message(chat_id=42, message_id=1, audio=_fake_audio(file_id='audio-1', file_name='one.mp3'))
-    message = _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-2', file_name='two.mp3'))
+    message = _fake_message(chat_id=42, message_id=2, photo=[object()], caption='Artist\nTitle')
 
-    await on_buffered_relevant_message(first_message, services, settings)
-    await on_buffered_relevant_message(message, services, settings)
+    await on_buffered_relevant_message(first_message, services, _settings())
+    await on_buffered_relevant_message(message, services, _settings())
     assert scheduler.job is not None
 
     await scheduler.job()
 
-    expected = Text(
-        'Tracks: ',
-        Bold('2'),
-        '\n',
-        create_padding_line(settings.message_width),
-        '\n',
-        'Select action:',
-    ).as_kwargs()
-    _assert_format_kwargs(message.answer.await_args.kwargs, expected)
-    reply_markup = message.answer.await_args.kwargs['reply_markup']
-    _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], [DUMMY_BUTTON_TEXT], ['Cancel']]
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek(42)] == [1, 2]
+    message.answer.assert_awaited_once_with(text="Can't dispatch input")
+    assert services.chat_message_buffer.peek(42) == []
+
+
+@pytest.mark.asyncio
+async def test_photo_without_caption_sends_cant_dispatch_input() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    first_message = _fake_message(chat_id=42, message_id=1, photo=[object()], caption=None)
+    message = _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3'))
+
+    await on_buffered_relevant_message(first_message, services, _settings())
+    await on_buffered_relevant_message(message, services, _settings())
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    message.answer.assert_awaited_once_with(text="Can't dispatch input")
+    assert services.chat_message_buffer.peek(42) == []
+
+
+@pytest.mark.asyncio
+async def test_odd_number_of_track_candidate_messages_sends_cant_dispatch_input() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    first_message = _fake_message(chat_id=42, message_id=1, photo=[object()], caption='Artist\nTitle')
+    second_message = _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-1', file_name='one.mp3'))
+    message = _fake_message(chat_id=42, message_id=3, photo=[object()], caption='Another Artist\nAnother Title')
+
+    await on_buffered_relevant_message(first_message, services, _settings())
+    await on_buffered_relevant_message(second_message, services, _settings())
+    await on_buffered_relevant_message(message, services, _settings())
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    message.answer.assert_awaited_once_with(text="Can't dispatch input")
+    assert services.chat_message_buffer.peek(42) == []
+
+
+@pytest.mark.asyncio
+async def test_audio_only_batch_sends_cant_dispatch_input() -> None:
+    scheduler = _FakeScheduler()
+    buffer = ChatMessageBuffer()
+    services = _services(clip_store=SimpleNamespace(), scheduler=scheduler, buffer=buffer)
+    first_message = _fake_message(chat_id=42, message_id=1, audio=_fake_audio(file_id='audio-1', file_name='one.mp3'))
+    message = _fake_message(chat_id=42, message_id=2, audio=_fake_audio(file_id='audio-2', file_name='two.mp3'))
+
+    await on_buffered_relevant_message(first_message, services, _settings())
+    await on_buffered_relevant_message(message, services, _settings())
+    assert scheduler.job is not None
+
+    await scheduler.job()
+
+    message.answer.assert_awaited_once_with(text="Can't dispatch input")
+    assert services.chat_message_buffer.peek(42) == []
 
 
 @pytest.mark.asyncio

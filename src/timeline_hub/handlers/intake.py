@@ -27,26 +27,31 @@ async def on_buffered_relevant_message(
 
     async def send_action_selection() -> None:
         buffered_messages = services.chat_message_buffer.peek(chat_id)
-        video_count = len(
-            [buffered_message for buffered_message in buffered_messages if buffered_message.video is not None]
-        )
-        audio_count = len(
-            [buffered_message for buffered_message in buffered_messages if buffered_message.audio is not None]
+        ordered_buffered_messages = services.chat_message_buffer.peek_flat(chat_id)
+        has_audio = any(buffered_message.audio is not None for buffered_message in buffered_messages)
+        has_video = any(
+            buffered_message.video is not None or getattr(buffered_message, 'animation', None) is not None
+            for buffered_message in buffered_messages
         )
 
-        if video_count >= 1 and audio_count == 0:
-            handled = await try_dispatch_clip_intake(
-                message=message,
-                services=services,
-                settings=settings,
-            )
-        elif audio_count >= 1 and video_count == 0:
+        if has_audio and not has_video:
+            if not _is_valid_track_batch(ordered_buffered_messages):
+                services.chat_message_buffer.flush(chat_id)
+                await message.answer(text="Can't dispatch input")
+                return
+
             handled = await try_dispatch_track_intake(
                 message=message,
                 services=services,
                 settings=settings,
             )
-        elif video_count >= 1 and audio_count >= 1:
+        elif has_video and not has_audio:
+            handled = await try_dispatch_clip_intake(
+                message=message,
+                services=services,
+                settings=settings,
+            )
+        elif has_video and has_audio:
             services.chat_message_buffer.flush(chat_id)
             await message.answer(text="Can't dispatch mixed input")
             return
@@ -66,6 +71,24 @@ async def on_buffered_relevant_message(
         key=chat_id,
         delay=settings.forward_batch_timeout,
     )
+
+
+def _is_valid_track_batch(messages: list[Message]) -> bool:
+    if len(messages) < 2 or len(messages) % 2 != 0:
+        return False
+
+    for index, buffered_message in enumerate(messages):
+        if index % 2 == 0:
+            if buffered_message.photo is None:
+                return False
+            if buffered_message.caption is None or not buffered_message.caption.strip():
+                return False
+            continue
+
+        if buffered_message.audio is None:
+            return False
+
+    return True
 
 
 async def _show_fallback_menu(

@@ -41,6 +41,21 @@ def test_append_and_peek_returns_copy_without_mutating_internal_state() -> None:
     assert buffer.version(100) == 2
 
 
+def test_peek_ordered_returns_messages_sorted_by_message_id() -> None:
+    buffer = ChatMessageBuffer()
+    third = _message(3, chat_id=100)
+    first = _message(1, chat_id=100)
+    second = _message(2, chat_id=100)
+
+    buffer.append(third, chat_id=100)
+    buffer.append(first, chat_id=100)
+    buffer.append(second, chat_id=100)
+
+    assert buffer.peek_flat(100) == [first, second, third]
+    assert buffer.peek(100) == [third, first, second]
+    assert buffer.version(100) == 3
+
+
 def test_flush_returns_all_messages_for_chat_and_clears_it() -> None:
     buffer = ChatMessageBuffer()
     first = _message(1, chat_id=100)
