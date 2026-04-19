@@ -2,11 +2,14 @@
 
 ## Telegram UI invariants
 
-These rules apply only to messages that include inline keyboards. Plain text messages must remain unmodified and must not be padded or height-normalized.
+These rules apply only to real action-selection menus with inline keyboards. Plain text messages must remain unmodified and must not be padded or height-normalized.
 
-Every message with buttons must render:
+Every real action-selection menu must render:
 - exactly 3 text lines
 - exactly 3 rows of buttons
+
+Short informational prompts with a single terminal action are not action-selection menus.
+They may use a smaller keyboard when they are explicitly informing the user about buffer state and only offering a flush/cancel action.
 
 The UI is intentionally fixed-size and structurally predictable:
 - button positions follow stable patterns

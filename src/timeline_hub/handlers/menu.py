@@ -104,6 +104,12 @@ def stacked_keyboard(*, buttons: Sequence[InlineKeyboardButton]) -> InlineKeyboa
     )
 
 
+def single_button_keyboard(*, button: InlineKeyboardButton) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[button]],
+    )
+
+
 def ensure_three_rows(
     *,
     top_row: list[InlineKeyboardButton],

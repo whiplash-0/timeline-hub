@@ -996,8 +996,10 @@ async def test_text_only_buffered_batch_shows_fallback_menu_without_flushing() -
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
-    _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [[DUMMY_BUTTON_TEXT], [DUMMY_BUTTON_TEXT], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Cancel']]
+    assert len(reply_markup.inline_keyboard) == 1
+    assert len(reply_markup.inline_keyboard[0]) == 1
+    assert reply_markup.inline_keyboard[0][0].text == 'Cancel'
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1]
 
 

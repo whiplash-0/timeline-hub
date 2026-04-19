@@ -4,7 +4,7 @@ from aiogram.types import InlineKeyboardButton, Message
 from aiogram.utils.formatting import Bold, Text
 
 from timeline_hub.handlers.clips.ingest import try_dispatch_clip_intake
-from timeline_hub.handlers.menu import create_padding_line, dummy_button, stacked_keyboard
+from timeline_hub.handlers.menu import create_padding_line, single_button_keyboard
 from timeline_hub.handlers.tracks.ingest import (
     TrackIntakeAction,
     TrackIntakeActionCallbackData,
@@ -110,17 +110,13 @@ async def _show_fallback_menu(
             '\n',
             'Select action:',
         ).as_kwargs(),
-        reply_markup=stacked_keyboard(
-            buttons=[
-                dummy_button(),
-                dummy_button(),
-                InlineKeyboardButton(
-                    text='Cancel',
-                    callback_data=TrackIntakeActionCallbackData(
-                        action=TrackIntakeAction.CANCEL,
-                        buffer_version=buffer_version,
-                    ).pack(),
-                ),
-            ]
+        reply_markup=single_button_keyboard(
+            button=InlineKeyboardButton(
+                text='Cancel',
+                callback_data=TrackIntakeActionCallbackData(
+                    action=TrackIntakeAction.CANCEL,
+                    buffer_version=buffer_version,
+                ).pack(),
+            )
         ),
     )
