@@ -130,9 +130,9 @@ def _configure_logging() -> None:
 def _default_track_preset() -> Preset:
     return Preset(
         name='Default',
-        slowed=PresetMode(step=0.08, levels=4),
-        sped_up=PresetMode(step=0.04, levels=2),
-        reverb_start=0.03,
+        slowed=PresetMode(step=0.08, levels=3),
+        sped_up=PresetMode(step=0.06, levels=3),
+        reverb_start=0.02,
         reverb_step=0.02,
     )
 
