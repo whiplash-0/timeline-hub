@@ -14,6 +14,7 @@ class Extension(StrEnum):
     """Supported file extensions for typed storage-boundary payloads."""
 
     MP4 = 'mp4'
+    MP3 = 'mp3'
     OPUS = 'opus'
     JPG = 'jpg'
 

@@ -375,6 +375,9 @@ def test_preset_rejects_missing_all_variant_modes() -> None:
 
 
 def test_extension_from_string_normalizes_supported_values() -> None:
+    assert Extension.from_string('mp3') is Extension.MP3
+    assert Extension.from_string('.mp3') is Extension.MP3
+    assert Extension.from_string('MP3') is Extension.MP3
     assert Extension.from_string('opus') is Extension.OPUS
     assert Extension.from_string('.opus') is Extension.OPUS
     assert Extension.from_string('OPUS') is Extension.OPUS
@@ -388,6 +391,8 @@ def test_extension_from_string_rejects_unknown_value() -> None:
 @pytest.mark.parametrize(
     ('filename', 'expected'),
     [
+        ('track.mp3', Extension.MP3),
+        ('TRACK.MP3', Extension.MP3),
         ('track.opus', Extension.OPUS),
         ('TRACK.OPUS', Extension.OPUS),
         ('cover.jpg', Extension.JPG),
@@ -408,6 +413,7 @@ def test_extension_from_filename_rejects_invalid_values(filename: object) -> Non
 
 
 def test_extension_suffix_matches_storage_suffix() -> None:
+    assert Extension.MP3.suffix == '.mp3'
     assert Extension.OPUS.suffix == '.opus'
     assert Extension.JPG.suffix == '.jpg'
 
@@ -953,11 +959,11 @@ def test_variant_key_uses_ordered_variant_index() -> None:
 
     assert store._variant_key(group_prefix, _UUID_1, index=1) == S3Client.join(
         group_prefix,
-        _UUID_1 + '-variant-1' + Extension.OPUS.suffix,
+        _UUID_1 + '-variant-1' + Extension.MP3.suffix,
     )
     assert store._variant_key(group_prefix, _UUID_1, index=2) == S3Client.join(
         group_prefix,
-        _UUID_1 + '-variant-2' + Extension.OPUS.suffix,
+        _UUID_1 + '-variant-2' + Extension.MP3.suffix,
     )
 
 
@@ -967,11 +973,11 @@ def test_instrumental_variant_key_uses_ordered_variant_index() -> None:
 
     assert store._instrumental_variant_key(group_prefix, _UUID_1, index=1) == S3Client.join(
         group_prefix,
-        _UUID_1 + '-instrumental-variant-1' + Extension.OPUS.suffix,
+        _UUID_1 + '-instrumental-variant-1' + Extension.MP3.suffix,
     )
     assert store._instrumental_variant_key(group_prefix, _UUID_1, index=2) == S3Client.join(
         group_prefix,
-        _UUID_1 + '-instrumental-variant-2' + Extension.OPUS.suffix,
+        _UUID_1 + '-instrumental-variant-2' + Extension.MP3.suffix,
     )
 
 
@@ -997,11 +1003,11 @@ def test_attached_and_variant_keys_include_storage_extensions() -> None:
     )
     assert store._variant_key(group_prefix, _UUID_1, index=1) == S3Client.join(
         group_prefix,
-        _UUID_1 + '-variant-1' + Extension.OPUS.suffix,
+        _UUID_1 + '-variant-1' + Extension.MP3.suffix,
     )
     assert store._instrumental_variant_key(group_prefix, _UUID_1, index=1) == S3Client.join(
         group_prefix,
-        _UUID_1 + '-instrumental-variant-1' + Extension.OPUS.suffix,
+        _UUID_1 + '-instrumental-variant-1' + Extension.MP3.suffix,
     )
 
 
@@ -4217,11 +4223,18 @@ def _variant_storage_objects(
     }
 
 
-def _patch_create_audio_variant(monkeypatch: pytest.MonkeyPatch) -> list[tuple[bytes, float, float]]:
-    calls: list[tuple[bytes, float, float]] = []
+def _patch_create_audio_variant(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    calls: list[dict[str, object]] = []
 
-    async def _fake_create_audio_variant(audio_bytes: bytes, *, speed: float, reverb: float, **_: object) -> bytes:
-        calls.append((audio_bytes, speed, reverb))
+    async def _fake_create_audio_variant(audio_bytes: bytes, *, speed: float, reverb: float, **kwargs: object) -> bytes:
+        calls.append(
+            {
+                'audio_bytes': audio_bytes,
+                'speed': speed,
+                'reverb': reverb,
+                **kwargs,
+            }
+        )
         return f'{audio_bytes.decode()}|{speed:.2f}|{reverb:.2f}'.encode()
 
     monkeypatch.setattr(track_store_module, 'create_audio_variant', _fake_create_audio_variant)
@@ -4303,6 +4316,7 @@ async def test_fetch_with_explicit_preset_returns_current_original_and_instrumen
     assert result.cover.extension is Extension.JPG
     assert not hasattr(result, 'cover_filename')
     assert isinstance(result.variants[0], FetchedVariant)
+    assert [variant.level for variant in result.variants] == [3, 2, 1, 1, 2]
     assert [variant.speed for variant in result.variants] == sorted(variant.speed for variant in result.variants)
     assert [variant.audio.data for variant in result.variants] == [
         b'orig|1',
@@ -4311,7 +4325,7 @@ async def test_fetch_with_explicit_preset_returns_current_original_and_instrumen
         b'orig|4',
         b'orig|5',
     ]
-    assert all(variant.audio.extension is Extension.OPUS for variant in result.variants)
+    assert all(variant.audio.extension is Extension.MP3 for variant in result.variants)
     assert result.instrumental_variants is not None
     assert [variant.audio.data for variant in result.instrumental_variants] == [
         b'inst|1',
@@ -4320,7 +4334,7 @@ async def test_fetch_with_explicit_preset_returns_current_original_and_instrumen
         b'inst|4',
         b'inst|5',
     ]
-    assert all(variant.audio.extension is Extension.OPUS for variant in result.instrumental_variants)
+    assert all(variant.audio.extension is Extension.MP3 for variant in result.instrumental_variants)
     assert (
         _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
         not in s3_client.get_calls
@@ -4421,6 +4435,7 @@ async def test_fetch_with_none_resolves_current_default_preset_and_returns_no_in
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     generation_calls = _patch_create_audio_variant(monkeypatch)
+    probe_calls = _patch_probe_audio_sample_rate(monkeypatch, sample_rate=44_100)
 
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
@@ -4458,10 +4473,29 @@ async def test_fetch_with_none_resolves_current_default_preset_and_returns_no_in
 
     assert result.instrumental_variants is None
     assert not hasattr(result, 'cover_filename')
+    assert probe_calls == [b'authoritative-track']
     assert generation_calls == [
-        (b'authoritative-track', 0.9, 0.03),
-        (b'authoritative-track', 0.95, 0.02),
+        {
+            'audio_bytes': b'authoritative-track',
+            'speed': 0.9,
+            'reverb': 0.03,
+            'input_sample_rate': 44_100,
+            'output_format': 'mp3',
+            'mp3_quality': 1,
+        },
+        {
+            'audio_bytes': b'authoritative-track',
+            'speed': 0.95,
+            'reverb': 0.02,
+            'input_sample_rate': 44_100,
+            'output_format': 'mp3',
+            'mp3_quality': 1,
+        },
     ]
+    variant_put_calls = [call for call in s3_client.put_calls if call[0] != manifest_key]
+    assert len(variant_put_calls) == 2
+    assert all(call[0].endswith(Extension.MP3.suffix) for call in variant_put_calls)
+    assert all(call[2] == track_store_module.S3ContentType.MP3 for call in variant_put_calls)
     assert isinstance(result, FetchedVariants)
     assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
         [
@@ -4521,6 +4555,7 @@ async def test_fetch_raises_value_error_for_unknown_track_id() -> None:
 @pytest.mark.asyncio
 async def test_fetch_regenerates_original_variants_when_preset_id_mismatches(monkeypatch: pytest.MonkeyPatch) -> None:
     generation_calls = _patch_create_audio_variant(monkeypatch)
+    _patch_probe_audio_sample_rate(monkeypatch)
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
@@ -4579,7 +4614,7 @@ async def test_fetch_regenerates_original_variants_when_preset_id_mismatches(mon
         b'authoritative-track|1.06|0.01',
         b'authoritative-track|1.12|0.02',
     ]
-    assert all(variant.audio.extension is Extension.OPUS for variant in result.variants)
+    assert all(variant.audio.extension is Extension.MP3 for variant in result.variants)
     rewritten_manifest = json.loads(s3_client.objects[manifest_key].decode('utf-8'))
     assert rewritten_manifest['data'][0]['preset'] == _applied_preset_dict(
         _applied_preset(preset_id=1, version=3, preset=_sample_stored_presets()[0].preset)
@@ -4592,6 +4627,7 @@ async def test_fetch_regenerates_original_variants_when_preset_version_mismatche
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     generation_calls = _patch_create_audio_variant(monkeypatch)
+    _patch_probe_audio_sample_rate(monkeypatch)
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
@@ -4639,6 +4675,7 @@ async def test_fetch_regenerates_original_variants_when_preset_version_mismatche
 @pytest.mark.asyncio
 async def test_fetch_treats_variant_count_mismatch_as_stale(monkeypatch: pytest.MonkeyPatch) -> None:
     generation_calls = _patch_create_audio_variant(monkeypatch)
+    _patch_probe_audio_sample_rate(monkeypatch)
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
@@ -4688,6 +4725,7 @@ async def test_fetch_regenerates_instrumental_variants_when_manifest_flag_is_fal
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     generation_calls = _patch_create_audio_variant(monkeypatch)
+    _patch_probe_audio_sample_rate(monkeypatch)
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
@@ -4744,7 +4782,7 @@ async def test_fetch_regenerates_instrumental_variants_when_manifest_flag_is_fal
     assert s3_client.delete_keys_calls == []
     assert instrumental_key in s3_client.get_calls
     assert result.instrumental_variants is not None
-    assert all(call[0] == b'authoritative-instrumental' for call in generation_calls)
+    assert all(call['audio_bytes'] == b'authoritative-instrumental' for call in generation_calls)
     rewritten_manifest = json.loads(s3_client.objects[manifest_key].decode('utf-8'))
     assert rewritten_manifest['data'][0]['has_instrumental_variants'] is True
 
@@ -4752,6 +4790,7 @@ async def test_fetch_regenerates_instrumental_variants_when_manifest_flag_is_fal
 @pytest.mark.asyncio
 async def test_fetch_regeneration_rewrites_manifest_with_applied_preset(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_create_audio_variant(monkeypatch)
+    _patch_probe_audio_sample_rate(monkeypatch)
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
@@ -4792,6 +4831,7 @@ async def test_fetch_wraps_partial_original_variant_upload_as_sync_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_create_audio_variant(monkeypatch)
+    _patch_probe_audio_sample_rate(monkeypatch)
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
@@ -4837,6 +4877,7 @@ async def test_fetch_wraps_partial_instrumental_variant_upload_as_sync_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_create_audio_variant(monkeypatch)
+    _patch_probe_audio_sample_rate(monkeypatch)
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     cover_key = _cover_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
@@ -4898,6 +4939,7 @@ async def test_fetch_wraps_manifest_write_failure_after_regeneration_as_sync_err
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_create_audio_variant(monkeypatch)
+    _patch_probe_audio_sample_rate(monkeypatch)
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
@@ -5069,6 +5111,7 @@ async def test_fetch_wraps_stale_instrumental_variant_deletion_as_sync_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_create_audio_variant(monkeypatch)
+    _patch_probe_audio_sample_rate(monkeypatch)
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)
@@ -5212,6 +5255,7 @@ async def test_fetch_wraps_instrumental_source_read_failure_after_prior_mutation
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_create_audio_variant(monkeypatch)
+    _patch_probe_audio_sample_rate(monkeypatch)
     group = _track_group()
     manifest_key = _manifest_key(universe=group.universe, year=group.year, season=group.season)
     track_key = _track_key(universe=group.universe, year=group.year, season=group.season, track_id=_UUID_1)

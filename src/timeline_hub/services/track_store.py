@@ -143,8 +143,9 @@ class TrackInfo:
 
 @dataclass(frozen=True, slots=True)
 class FetchedVariant:
-    """One generated playable track variant returned by `fetch()` as Opus `FileBytes`."""
+    """One generated playable track variant returned by `fetch()` as MP3 `FileBytes`."""
 
+    level: int
     speed: float
     reverb: float
     audio: FileBytes
@@ -444,6 +445,7 @@ class ManifestEntry:
 
 @dataclass(frozen=True, slots=True)
 class _ResolvedVariantSpec:
+    level: int
     speed: float
     reverb: float
 
@@ -983,12 +985,14 @@ class TrackStore:
     commit, while read-path calls may reuse the cached manifest directly.
 
     Storage format invariant:
-        Persisted audio objects are always stored as Opus with `.opus`
-        extensions in their S3 object keys. Persisted cover objects are always
-        stored as JPEG with `.jpg` extensions in their S3 object keys.
-        These extensions are part of the `TrackStore` S3 key contract, while
-        the public API uses `FileBytes` so returned and accepted media always
-        carries an explicit `Extension`.
+        Authoritative original-track and instrumental audio objects are stored
+        as Opus with `.opus` extensions in their S3 object keys. Generated
+        cached variants are stored as MP3 with `.mp3` extensions in their S3
+        object keys. Persisted cover objects are always stored as JPEG with
+        `.jpg` extensions in their S3 object keys. These extensions are part
+        of the `TrackStore` S3 key contract, while the public API uses
+        `FileBytes` so returned and accepted media always carries an explicit
+        `Extension`.
 
     Authoritative-state invariant:
         Normal-path operations assume each group's manifest is synchronized
@@ -1080,9 +1084,10 @@ class TrackStore:
         payload contains only generated variants plus shared UI metadata:
         cover `FileBytes`. The authoritative original track and optional
         authoritative instrumental objects are read only when regeneration is
-        required. Persisted source and generated audio objects use `.opus` S3
-        keys, and per-track covers use `.jpg` S3 keys. Returned audio always
-        uses `Extension.OPUS`, and returned covers always use `Extension.JPG`.
+        required. Authoritative source audio objects use `.opus` S3 keys,
+        generated cached variants use `.mp3` S3 keys, and per-track covers use
+        `.jpg` S3 keys. Returned generated variant audio uses `Extension.MP3`,
+        and returned covers always use `Extension.JPG`.
 
         Preset resolution is delegated to `PresetStore`. An explicit
         caller-supplied preset id is strict, while the manifest snapshot id is
@@ -2449,12 +2454,12 @@ class TrackStore:
 
     def _variant_key(self, track_group_prefix: Prefix, track_id: TrackId, *, index: int) -> Key:
         validated_index = _expect_positive_int(index, field='index', context='variant key')
-        object_name = f'{track_id}-variant-{validated_index}{Extension.OPUS.suffix}'
+        object_name = f'{track_id}-variant-{validated_index}{Extension.MP3.suffix}'
         return S3Client.join(track_group_prefix, object_name)
 
     def _instrumental_variant_key(self, track_group_prefix: Prefix, track_id: TrackId, *, index: int) -> Key:
         validated_index = _expect_positive_int(index, field='index', context='instrumental variant key')
-        object_name = f'{track_id}-instrumental-variant-{validated_index}{Extension.OPUS.suffix}'
+        object_name = f'{track_id}-instrumental-variant-{validated_index}{Extension.MP3.suffix}'
         return S3Client.join(track_group_prefix, object_name)
 
     def _new_track_id(self, *, manifest: Manifest) -> TrackId:
@@ -2515,6 +2520,7 @@ class TrackStore:
             for level in range(1, preset.slowed.levels + 1):
                 variant_specs.append(
                     _ResolvedVariantSpec(
+                        level=level,
                         speed=1.0 - level * preset.slowed.step,
                         reverb=preset.reverb_start + (level - 1) * preset.reverb_step,
                     )
@@ -2523,6 +2529,7 @@ class TrackStore:
             for level in range(1, preset.sped_up.levels + 1):
                 variant_specs.append(
                     _ResolvedVariantSpec(
+                        level=level,
                         speed=1.0 + level * preset.sped_up.step,
                         reverb=preset.reverb_start + (level - 1) * preset.reverb_step,
                     )
@@ -2549,9 +2556,10 @@ class TrackStore:
             variant_bytes = await self._s3_client.get_bytes(variant_key)
             variants.append(
                 FetchedVariant(
+                    level=spec.level,
                     speed=spec.speed,
                     reverb=spec.reverb,
-                    audio=FileBytes(data=variant_bytes, extension=Extension.OPUS),
+                    audio=FileBytes(data=variant_bytes, extension=Extension.MP3),
                 )
             )
 
@@ -2567,14 +2575,16 @@ class TrackStore:
         instrumental: bool,
         uploaded_keys: list[Key] | None = None,
     ) -> tuple[FetchedVariant, ...]:
+        source_sample_rate = await probe_audio_sample_rate(source_bytes)
         variants: list[FetchedVariant] = []
         for index, spec in enumerate(variant_specs, start=1):
             generated_bytes = await create_audio_variant(
                 source_bytes,
                 speed=spec.speed,
                 reverb=spec.reverb,
-                input_sample_rate=48_000,
-                output_format='opus',
+                input_sample_rate=source_sample_rate,
+                output_format='mp3',
+                mp3_quality=1,
             )
             variant_key = self._variant_storage_key(
                 track_group_prefix=track_group_prefix,
@@ -2585,15 +2595,16 @@ class TrackStore:
             await self._s3_client.put_bytes(
                 variant_key,
                 generated_bytes,
-                content_type=S3ContentType.OPUS,
+                content_type=S3ContentType.MP3,
             )
             if uploaded_keys is not None:
                 uploaded_keys.append(variant_key)
             variants.append(
                 FetchedVariant(
+                    level=spec.level,
                     speed=spec.speed,
                     reverb=spec.reverb,
-                    audio=FileBytes(data=generated_bytes, extension=Extension.OPUS),
+                    audio=FileBytes(data=generated_bytes, extension=Extension.MP3),
                 )
             )
 
