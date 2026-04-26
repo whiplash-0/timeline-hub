@@ -102,11 +102,12 @@ async def create_audio_variant(
     - `'opus'` -> Opus in an Ogg container (bitrate-controlled)
     - `'mp3'` -> MP3 encoded with libmp3lame (VBR quality-controlled)
 
-    Variant generation preserves the current project behavior:
-    - for `speed < 1`, apply slowed playback by changing sample rate and
-      resampling back to the target output sample rate
-    - for `speed >= 1`, apply volume boost, sped-up playback, and a limiter
-    - if `reverb > 0`, apply echo reverb after resampling
+    Variant generation uses the restored baseline wet path:
+    - change playback speed by adjusting sample rate, then resample back to
+      the target output sample rate with high-quality SOXR resampling
+    - apply branch-specific EQ to shape presence and tame upper highs
+    - for `speed >= 1`, apply a moderated volume boost and a light limiter
+    - if `reverb > 0`, apply scaled echo reverb at the end of the chain
     - if `reverb == 0`, no reverb is applied
 
     Args:
@@ -119,7 +120,7 @@ async def create_audio_variant(
         opus_bitrate: Target Opus bitrate in kbps. Used only when
             `output_format='opus'`.
         mp3_quality: MP3 VBR quality level (LAME `-q:a`). Lower is higher
-            quality. Typical range is 0–9, with 2 being high quality.
+            quality. Typical range is 0-9, with 1 being very high quality.
             Used only when `output_format='mp3'`.
         timeout: Maximum time allowed for the ffmpeg subprocess run.
 
@@ -179,7 +180,7 @@ async def create_audio_variant(
         )
     else:
         output_suffix = '.mp3'
-        output_sample_rate = 44_100
+        output_sample_rate = 48_000
         codec_args = (
             '-c:a',
             'libmp3lame',
@@ -198,23 +199,33 @@ async def create_audio_variant(
     try:
         input_path.write_bytes(audio_bytes)
 
+        filter_parts = [
+            f'asetrate={input_sample_rate}*{speed}',
+            f'aresample={output_sample_rate}:resampler=soxr:precision=28:cheby=1',
+        ]
+
         if speed < 1.0:
-            filter_parts = [
-                f'asetrate={input_sample_rate}*{speed}',
-                f'aresample={output_sample_rate}',
-            ]
+            filter_parts.extend(
+                [
+                    'equalizer=f=5000:t=q:w=1:g=1',
+                    'equalizer=f=14000:t=q:w=1:g=-2',
+                ]
+            )
         else:
-            filter_parts = [
-                f'volume={speed}',
-                f'asetrate={input_sample_rate}*{speed}',
-                f'aresample={output_sample_rate}',
-            ]
+            fast_volume = 1.0 + (speed - 1.0) * 0.5
+            filter_parts.extend(
+                [
+                    'equalizer=f=5000:t=q:w=1:g=2',
+                    'equalizer=f=14000:t=q:w=1:g=-2',
+                    f'volume={fast_volume}',
+                    'alimiter=limit=0.98',
+                ]
+            )
 
-        if reverb > 0:
-            filter_parts.append(f'aecho=1.0:0.95:50:{reverb}')
-
-        if speed >= 1.0:
-            filter_parts.append('alimiter=limit=0.95')
+        effective_reverb = reverb * 2.0
+        if effective_reverb > 0:
+            echo_decay = min(max(effective_reverb, 0.001), 0.98)
+            filter_parts.append(f'aecho=1.0:0.95:50:{echo_decay}')
 
         audio_filter = ','.join(filter_parts)
 

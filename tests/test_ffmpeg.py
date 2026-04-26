@@ -32,6 +32,32 @@ async def test_create_audio_variant_rejects_invalid_input_sample_rate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_audio_variant_rejects_non_integer_mp3_quality() -> None:
+    with pytest.raises(ValueError, match='mp3_quality must be an integer'):
+        await ffmpeg_module.create_audio_variant(
+            b'source-audio',
+            speed=1.0,
+            reverb=0.0,
+            input_sample_rate=48_000,
+            output_format='mp3',
+            mp3_quality=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_audio_variant_rejects_out_of_range_mp3_quality() -> None:
+    with pytest.raises(ValueError, match='mp3_quality must be in 0..9'):
+        await ffmpeg_module.create_audio_variant(
+            b'source-audio',
+            speed=1.0,
+            reverb=0.0,
+            input_sample_rate=48_000,
+            output_format='mp3',
+            mp3_quality=10,
+        )
+
+
+@pytest.mark.asyncio
 async def test_create_audio_variant_builds_slowdown_filter_without_reverb(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -71,7 +97,8 @@ async def test_create_audio_variant_builds_slowdown_filter_without_reverb(
         observed['cmd'][10],
         '-vn',
         '-af',
-        'asetrate=44100*0.75,aresample=48000',
+        'asetrate=44100*0.75,aresample=48000:resampler=soxr:precision=28:cheby=1,'
+        'equalizer=f=5000:t=q:w=1:g=1,equalizer=f=14000:t=q:w=1:g=-2',
         '-ar',
         '48000',
         '-c:a',
@@ -125,7 +152,9 @@ async def test_create_audio_variant_builds_speedup_filter_with_reverb(
             observed_cmds[0][10],
             '-vn',
             '-af',
-            'volume=1.25,asetrate=48000*1.25,aresample=48000,aecho=1.0:0.95:50:0.4,alimiter=limit=0.95',
+            'asetrate=48000*1.25,aresample=48000:resampler=soxr:precision=28:cheby=1,'
+            'equalizer=f=5000:t=q:w=1:g=2,equalizer=f=14000:t=q:w=1:g=-2,'
+            'volume=1.125,alimiter=limit=0.98,aecho=1.0:0.95:50:0.8',
             '-ar',
             '48000',
             '-c:a',
@@ -143,6 +172,58 @@ async def test_create_audio_variant_builds_speedup_filter_with_reverb(
 
 @pytest.mark.asyncio
 async def test_create_audio_variant_builds_mp3_output_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, tuple[str, ...] | timedelta] = {}
+
+    async def _fake_run_ffmpeg(cmd: tuple[str, ...], timeout: timedelta) -> bytes:
+        observed['cmd'] = cmd
+        observed['run_timeout'] = timeout
+        Path(cmd[-1]).write_bytes(b'variant-audio')
+        return b''
+
+    monkeypatch.setattr(ffmpeg_module, '_run_ffmpeg', _fake_run_ffmpeg)
+
+    result = await ffmpeg_module.create_audio_variant(
+        b'source-audio',
+        speed=1.0,
+        reverb=0.0,
+        input_sample_rate=48_000,
+        output_format='mp3',
+        timeout=timedelta(seconds=7),
+    )
+
+    assert result == b'variant-audio'
+    assert observed['run_timeout'] == timedelta(seconds=7)
+    assert observed['cmd'] == (
+        'ffmpeg',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-nostats',
+        '-nostdin',
+        '-y',
+        '-threads',
+        '1',
+        '-i',
+        observed['cmd'][10],
+        '-vn',
+        '-af',
+        'asetrate=48000*1.0,aresample=48000:resampler=soxr:precision=28:cheby=1,'
+        'equalizer=f=5000:t=q:w=1:g=2,equalizer=f=14000:t=q:w=1:g=-2,'
+        'volume=1.0,alimiter=limit=0.98',
+        '-ar',
+        '48000',
+        '-c:a',
+        'libmp3lame',
+        '-q:a',
+        '1',
+        observed['cmd'][-1],
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_audio_variant_builds_mp3_output_args_with_custom_quality(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed: dict[str, tuple[str, ...] | timedelta] = {}
@@ -181,9 +262,11 @@ async def test_create_audio_variant_builds_mp3_output_args(
         observed['cmd'][10],
         '-vn',
         '-af',
-        'volume=1.0,asetrate=48000*1.0,aresample=44100,alimiter=limit=0.95',
+        'asetrate=48000*1.0,aresample=48000:resampler=soxr:precision=28:cheby=1,'
+        'equalizer=f=5000:t=q:w=1:g=2,equalizer=f=14000:t=q:w=1:g=-2,'
+        'volume=1.0,alimiter=limit=0.98',
         '-ar',
-        '44100',
+        '48000',
         '-c:a',
         'libmp3lame',
         '-q:a',

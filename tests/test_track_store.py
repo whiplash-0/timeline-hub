@@ -4513,7 +4513,6 @@ async def test_fetch_with_none_resolves_current_default_preset_and_returns_no_in
             'reverb': 0.03,
             'input_sample_rate': 44_100,
             'output_format': 'mp3',
-            'mp3_quality': 1,
         },
         {
             'audio_bytes': b'authoritative-track',
@@ -4521,7 +4520,6 @@ async def test_fetch_with_none_resolves_current_default_preset_and_returns_no_in
             'reverb': 0.02,
             'input_sample_rate': 44_100,
             'output_format': 'mp3',
-            'mp3_quality': 1,
         },
     ]
     variant_put_calls = [call for call in s3_client.put_calls if call[0] != manifest_key]

@@ -2598,7 +2598,6 @@ class TrackStore:
                 reverb=spec.reverb,
                 input_sample_rate=source_sample_rate,
                 output_format='mp3',
-                mp3_quality=1,
             )
             variant_key = self._variant_storage_key(
                 track_group_prefix=track_group_prefix,
