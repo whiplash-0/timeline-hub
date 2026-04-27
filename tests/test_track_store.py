@@ -2456,7 +2456,7 @@ async def test_update_audio_overwrites_track_deletes_variants_and_preserves_inst
     )
     store = _store(s3_client)
 
-    await store.update(group, _UUID_1, audio=FileBytes(data=b'new-track', extension=Extension.OPUS))
+    await store.update(group, _UUID_1, track=FileBytes(data=b'new-track', extension=Extension.OPUS))
 
     assert probe_calls == [b'new-track']
     assert s3_client.delete_keys_calls == [original_variant_keys]
@@ -2528,7 +2528,7 @@ async def test_update_audio_wraps_partial_variant_deletion_as_sync_error(
     store = _store(s3_client)
 
     with pytest.raises(TrackUpdateManifestSyncError, match='original_variant_delete') as excinfo:
-        await store.update(group, _UUID_1, audio=FileBytes(data=b'new-track', extension=Extension.OPUS))
+        await store.update(group, _UUID_1, track=FileBytes(data=b'new-track', extension=Extension.OPUS))
 
     assert probe_calls == [b'new-track']
     assert excinfo.value.stage == 'original_variant_delete'
@@ -2616,7 +2616,7 @@ async def test_update_later_stage_sync_error_unions_prior_and_assumed_touched_ke
         await store.update(
             group,
             _UUID_1,
-            audio=FileBytes(data=b'new-track', extension=Extension.OPUS),
+            track=FileBytes(data=b'new-track', extension=Extension.OPUS),
             instrumental=FileBytes(data=b'new-instrumental', extension=Extension.OPUS),
         )
 
@@ -2883,8 +2883,8 @@ async def test_update_rejects_audio_with_wrong_extension() -> None:
         )
     )
 
-    with pytest.raises(InvalidExtensionError, match='audio must use Extension.OPUS'):
-        await store.update(group, _UUID_1, audio=FileBytes(data=b'new-track', extension=Extension.JPG))
+    with pytest.raises(InvalidExtensionError, match='track must use Extension.OPUS'):
+        await store.update(group, _UUID_1, track=FileBytes(data=b'new-track', extension=Extension.JPG))
 
 
 @pytest.mark.asyncio

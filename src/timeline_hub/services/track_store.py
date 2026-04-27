@@ -1540,7 +1540,7 @@ class TrackStore:
         *,
         artists: tuple[str, ...] | None = None,
         title: str | None = None,
-        audio: FileBytes | None = None,
+        track: FileBytes | None = None,
         instrumental: FileBytes | None = None,
         cover: FileBytes | None = None,
     ) -> None:
@@ -1552,8 +1552,8 @@ class TrackStore:
         instrumental or replace the existing one. Cover updates are the one
         album-linked exception: `cover` fans out across all current
         manifest entries with the same `album_id`, while preserving one
-        physical `.jpg` cover object per track. Updated original audio and
-        instrumental audio must be Opus `FileBytes`. Updated cover must be
+        physical `.jpg` cover object per track. Updated original track audio
+        and instrumental audio must be Opus `FileBytes`. Updated cover must be
         JPG `FileBytes`.
 
         Invariant:
@@ -1571,13 +1571,13 @@ class TrackStore:
             TrackInvalidAudioFormatError: If provided audio bytes are not 48_000 Hz audio.
             TrackUpdateManifestSyncError: If one or more object mutations are applied but a later stage fails.
         """
-        if artists is None and title is None and audio is None and instrumental is None and cover is None:
+        if artists is None and title is None and track is None and instrumental is None and cover is None:
             raise ValueError('update() requires at least one update field')
 
-        if audio is not None:
-            if not isinstance(audio, FileBytes):
-                raise ValueError('audio must be FileBytes')
-            _require_extension(audio, Extension.OPUS, 'audio')
+        if track is not None:
+            if not isinstance(track, FileBytes):
+                raise ValueError('track must be FileBytes')
+            _require_extension(track, Extension.OPUS, 'track')
         if instrumental is not None:
             if not isinstance(instrumental, FileBytes):
                 raise ValueError('instrumental must be FileBytes')
@@ -1599,8 +1599,8 @@ class TrackStore:
         manifest = (await self._require_group_manifest(group, sub_season=None)).copy()
         entry = self._require_manifest_entry(manifest, group=group, track_id=track_id)
 
-        validated_audio_bytes = await self._validate_update_audio_bytes(
-            None if audio is None else audio.data,
+        validated_track_bytes = await self._validate_update_audio_bytes(
+            None if track is None else track.data,
             track_id=track_id,
         )
         validated_instrumental_bytes = await self._validate_update_instrumental_bytes(
@@ -1622,7 +1622,7 @@ class TrackStore:
             updated_entry = dataclass_replace(updated_entry, title=validated_title)
 
         # Original track updates invalidate only the original variant family.
-        if validated_audio_bytes is not None and entry.has_variants:
+        if validated_track_bytes is not None and entry.has_variants:
             original_variant_keys = self._variant_storage_keys(
                 track_group_prefix=track_group_prefix,
                 track_id=track_id,
@@ -1647,22 +1647,22 @@ class TrackStore:
                 raise sync_error from error
             touched_keys.extend(original_variant_keys)
 
-        if validated_audio_bytes is not None:
+        if validated_track_bytes is not None:
             try:
                 await self._s3_client.put_bytes(
                     track_key,
-                    validated_audio_bytes,
+                    validated_track_bytes,
                     content_type=S3ContentType.OPUS,
                 )
             except Exception as error:
                 if (
                     sync_error := self._build_update_sync_error(
                         error,
-                        stage='audio_upload',
+                        stage='track_upload',
                         track_id=track_id,
                         touched_keys=touched_keys,
                         manifest_key=manifest_key,
-                        note_prefix='Original audio upload error',
+                        note_prefix='Original track upload error',
                     )
                 ) is None:
                     raise
