@@ -445,6 +445,79 @@ async def test_fetch_returns_grouped_clips_with_portable_filenames(
 
 
 @pytest.mark.asyncio
+async def test_fetch_raw_preserves_manifest_order_with_concurrent_reads() -> None:
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    clip_key_1 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_1)
+    clip_key_2 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    clip_key_3 = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_3)
+
+    class _DelayedGetS3Client(_FakeS3Client):
+        async def get_bytes(self, key: str) -> bytes:
+            delay_by_key = {
+                clip_key_1: 0.02,
+                clip_key_2: 0.0,
+                clip_key_3: 0.01,
+            }
+            await asyncio.sleep(delay_by_key.get(key, 0.0))
+            return await super().get_bytes(key)
+
+    store = ClipStore(
+        _DelayedGetS3Client(
+            {
+                manifest_key: _manifest_bytes(
+                    [
+                        ManifestEntry(
+                            id=_UUID_1,
+                            video_hash=_HASH_A,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=1,
+                            order=1,
+                        ),
+                        ManifestEntry(
+                            id=_UUID_2,
+                            video_hash=_HASH_B,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=1,
+                            order=2,
+                        ),
+                        ManifestEntry(
+                            id=_UUID_3,
+                            video_hash=_HASH_C,
+                            sub_season=SubSeason.A,
+                            scope=Scope.COLLECTION,
+                            batch=1,
+                            order=3,
+                        ),
+                    ]
+                ),
+                clip_key_1: b'first',
+                clip_key_2: b'second',
+                clip_key_3: b'third',
+            }
+        )
+    )
+
+    batches = [
+        batch
+        async for batch in store.fetch(
+            ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+            ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+            audio_normalization=None,
+        )
+    ]
+
+    assert batches == [
+        (
+            FetchedClip(id=_UUID_1, file=_mp4_file(b'first')),
+            FetchedClip(id=_UUID_2, file=_mp4_file(b'second')),
+            FetchedClip(id=_UUID_3, file=_mp4_file(b'third')),
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_fetch_with_audio_normalization_generates_normalized_twins_and_updates_manifest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1804,6 +1877,172 @@ async def test_store_raises_sync_error_when_later_clip_upload_fails(
     assert manifest_key not in [call[0] for call in s3_client.put_calls]
     assert s3_client.deleted_keys == []
     assert store._manifest_cache[clip_group_prefix].to_dict() == Manifest(original_manifest).to_dict()
+
+
+@pytest.mark.asyncio
+async def test_store_raises_sync_error_with_concurrent_partial_success_in_input_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_B, b'second': _HASH_C, b'third': _HASH_D})
+    _patch_uuid7(monkeypatch, _UUID_2, _UUID_3, _UUID_4)
+    clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    first_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    second_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_3)
+    third_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_4)
+    s3_client = _FakeS3Client(put_failures={second_clip_key})
+    store = ClipStore(s3_client)
+
+    with pytest.raises(ClipManifestSyncError, match='Staged clip store failed at clip_upload') as excinfo:
+        await store.store(
+            clip_group,
+            clip_sub_group,
+            clips=[
+                _mp4_file(b'first'),
+                _mp4_file(b'second'),
+                _mp4_file(b'third'),
+            ],
+        )
+
+    assert excinfo.value.stage == 'clip_upload'
+    assert excinfo.value.written_keys == (first_clip_key, third_clip_key)
+    assert excinfo.value.affected_clip_ids == (_UUID_2, _UUID_4)
+    assert excinfo.value.manifest_key == manifest_key
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert str(excinfo.value.__cause__) == f'boom putting {second_clip_key}'
+    assert first_clip_key in s3_client.objects
+    assert second_clip_key not in s3_client.objects
+    assert third_clip_key in s3_client.objects
+    assert manifest_key not in s3_client.objects
+    assert s3_client.deleted_keys == []
+
+
+@pytest.mark.asyncio
+async def test_store_treats_cancelled_upload_result_as_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_B, b'second': _HASH_C, b'third': _HASH_D})
+    _patch_uuid7(monkeypatch, _UUID_2, _UUID_3, _UUID_4)
+    clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    first_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    second_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_3)
+    third_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_4)
+
+    class _CancelledPutS3Client(_FakeS3Client):
+        async def put_bytes(self, key: str, data: bytes, *, content_type: str | None = None) -> None:
+            if key == second_clip_key:
+                raise asyncio.CancelledError()
+            await super().put_bytes(key, data, content_type=content_type)
+
+    s3_client = _CancelledPutS3Client()
+    store = ClipStore(s3_client)
+
+    with pytest.raises(ClipManifestSyncError, match='Staged clip store failed at clip_upload') as excinfo:
+        await store.store(
+            clip_group,
+            clip_sub_group,
+            clips=[
+                _mp4_file(b'first'),
+                _mp4_file(b'second'),
+                _mp4_file(b'third'),
+            ],
+        )
+
+    assert excinfo.value.stage == 'clip_upload'
+    assert excinfo.value.written_keys == (first_clip_key, third_clip_key)
+    assert excinfo.value.affected_clip_ids == (_UUID_2, _UUID_4)
+    assert excinfo.value.manifest_key == manifest_key
+    assert isinstance(excinfo.value.__cause__, asyncio.CancelledError)
+    assert second_clip_key not in excinfo.value.written_keys
+    assert second_clip_key not in s3_client.objects
+    assert first_clip_key in s3_client.objects
+    assert third_clip_key in s3_client.objects
+    assert manifest_key not in s3_client.objects
+
+
+@pytest.mark.asyncio
+async def test_store_raises_first_exception_when_all_concurrent_uploads_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_B, b'second': _HASH_C})
+    _patch_uuid7(monkeypatch, _UUID_2, _UUID_3)
+    clip_group = ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1)
+    clip_sub_group = ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION)
+    first_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_2)
+    second_clip_key = _clip_key(year=2024, season=Season.S1, universe=Universe.WEST, clip_id=_UUID_3)
+    s3_client = _FakeS3Client(put_failures={first_clip_key, second_clip_key})
+    store = ClipStore(s3_client)
+
+    with pytest.raises(RuntimeError, match=f'boom putting {first_clip_key}'):
+        await store.store(
+            clip_group,
+            clip_sub_group,
+            clips=[
+                _mp4_file(b'first'),
+                _mp4_file(b'second'),
+            ],
+        )
+
+    assert first_clip_key not in s3_client.objects
+    assert second_clip_key not in s3_client.objects
+
+
+@pytest.mark.asyncio
+async def test_store_uploads_all_clips_successfully_with_concurrent_uploads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_hashes(monkeypatch, {b'first': _HASH_A, b'second': _HASH_B, b'third': _HASH_C})
+    _patch_uuid7(monkeypatch, _UUID_1, _UUID_2, _UUID_3)
+    manifest_key = _manifest_key(year=2024, season=Season.S1, universe=Universe.WEST)
+    s3_client = _FakeS3Client()
+    store = ClipStore(s3_client)
+
+    result = await store.store(
+        ClipGroup(universe=Universe.WEST, year=2024, season=Season.S1),
+        ClipSubGroup(sub_season=SubSeason.A, scope=Scope.COLLECTION),
+        clips=[
+            _mp4_file(b'first'),
+            _mp4_file(b'second'),
+            _mp4_file(b'third'),
+        ],
+    )
+
+    assert result == StoreResult(
+        stored_count=3,
+        duplicate_count=0,
+        clip_ids=(_UUID_1, _UUID_2, _UUID_3),
+    )
+    assert json.loads(s3_client.objects[manifest_key].decode('utf-8')) == _manifest_payload(
+        [
+            ManifestEntry(
+                id=_UUID_1,
+                video_hash=_HASH_A,
+                sub_season=SubSeason.A,
+                scope=Scope.COLLECTION,
+                batch=1,
+                order=1,
+            ),
+            ManifestEntry(
+                id=_UUID_2,
+                video_hash=_HASH_B,
+                sub_season=SubSeason.A,
+                scope=Scope.COLLECTION,
+                batch=1,
+                order=2,
+            ),
+            ManifestEntry(
+                id=_UUID_3,
+                video_hash=_HASH_C,
+                sub_season=SubSeason.A,
+                scope=Scope.COLLECTION,
+                batch=1,
+                order=3,
+            ),
+        ]
+    )
 
 
 @pytest.mark.asyncio

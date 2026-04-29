@@ -1,3 +1,4 @@
+import asyncio
 import itertools
 import json
 import math
@@ -709,16 +710,15 @@ class ClipStore:
         for _, batch_entries in itertools.groupby(matching_entries, key=lambda entry: entry.batch):
             batch_entries_list = list(batch_entries)
             if audio_normalization is None:
-                clip_batch: list[FetchedClip] = []
-                for entry in batch_entries_list:
-                    clip_key = self._clip_key(clip_group_prefix, entry.id)
-                    clip_bytes = await self._s3_client.get_bytes(clip_key)
-                    clip_batch.append(
-                        FetchedClip(
-                            id=entry.id,
-                            file=FileBytes(data=clip_bytes, extension=Extension.MP4),
-                        )
+                clip_keys = [self._clip_key(clip_group_prefix, entry.id) for entry in batch_entries_list]
+                clip_bytes_list = await asyncio.gather(*(self._s3_client.get_bytes(clip_key) for clip_key in clip_keys))
+                clip_batch = [
+                    FetchedClip(
+                        id=entry.id,
+                        file=FileBytes(data=clip_bytes, extension=Extension.MP4),
                     )
+                    for entry, clip_bytes in zip(batch_entries_list, clip_bytes_list, strict=True)
+                ]
                 yield tuple(clip_batch)
                 continue
 
@@ -816,26 +816,48 @@ class ClipStore:
 
         manifest_key = self._manifest_key(clip_group_prefix)
 
-        for entry, clip_bytes in new_entries:
-            clip_key = self._clip_key(clip_group_prefix, entry.id)
-            try:
-                await self._s3_client.put_bytes(
+        upload_keys = [self._clip_key(clip_group_prefix, entry.id) for entry, _ in new_entries]
+        clip_ids = [entry.id for entry, _ in new_entries]
+        clip_bytes_list = [clip_bytes for _, clip_bytes in new_entries]
+        upload_results = await asyncio.gather(
+            *(
+                self._s3_client.put_bytes(
                     clip_key,
                     clip_bytes,
                     content_type=S3ContentType.MP4,
                 )
-            except Exception as error:
-                if not uploaded_keys:
-                    raise
-                sync_error = ClipManifestSyncError(
-                    stage='clip_upload',
-                    written_keys=uploaded_keys,
-                    affected_clip_ids=[written_entry.id for written_entry, _ in new_entries[: len(uploaded_keys)]],
-                    manifest_key=manifest_key,
-                )
-                sync_error.add_note(f'Original clip upload error: {error!r}')
-                raise sync_error from error
+                for clip_key, clip_bytes in zip(upload_keys, clip_bytes_list, strict=True)
+            ),
+            return_exceptions=True,
+        )
+
+        failures: list[BaseException] = []
+        for clip_key, result in zip(upload_keys, upload_results, strict=True):
+            if isinstance(result, BaseException):
+                failures.append(result)
+                continue
             uploaded_keys.append(clip_key)
+
+        if failures:
+            if not uploaded_keys:
+                raise failures[0]
+            uploaded_keys_set = set(uploaded_keys)
+            successful_ids = [
+                clip_id
+                for clip_id, clip_key in zip(clip_ids, upload_keys, strict=True)
+                if clip_key in uploaded_keys_set
+            ]
+            sync_error = ClipManifestSyncError(
+                stage='clip_upload',
+                written_keys=uploaded_keys,
+                affected_clip_ids=successful_ids,
+                manifest_key=manifest_key,
+            )
+            if len(failures) == 1:
+                sync_error.add_note(f'Original clip upload error: {failures[0]!r}')
+            else:
+                sync_error.add_note(f'Original clip upload errors: {[repr(error) for error in failures]}')
+            raise sync_error from failures[0]
 
         try:
             await self._write_manifest_and_update_cache(
