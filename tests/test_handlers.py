@@ -1704,7 +1704,7 @@ async def test_valid_photo_audio_pairs_dispatch_to_track_menu() -> None:
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Instrumental', 'Track'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], ['Replace'], ['Cancel']]
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [
         1,
         2,
@@ -1748,7 +1748,7 @@ async def test_valid_out_of_order_appended_track_batch_dispatches_in_message_ord
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Instrumental', 'Track'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], ['Replace'], ['Cancel']]
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [
         2,
         1,
@@ -1798,7 +1798,7 @@ async def test_audio_before_photo_dispatches_to_track_menu() -> None:
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Instrumental', 'Track'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], ['Replace'], ['Cancel']]
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1, 2]
 
 
@@ -1825,7 +1825,7 @@ async def test_photo_without_caption_dispatches_to_track_menu() -> None:
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Instrumental', 'Track'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], ['Replace'], ['Cancel']]
 
 
 @pytest.mark.asyncio
@@ -1851,7 +1851,7 @@ async def test_single_line_caption_dispatches_to_track_menu() -> None:
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Instrumental', 'Track'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], ['Replace'], ['Cancel']]
 
 
 @pytest.mark.asyncio
@@ -1879,7 +1879,7 @@ async def test_odd_number_of_track_candidate_messages_dispatches_to_track_menu()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Instrumental', 'Track'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], ['Replace'], ['Cancel']]
 
 
 @pytest.mark.asyncio
@@ -1929,7 +1929,7 @@ async def test_photo_only_batch_dispatches_to_track_menu() -> None:
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Instrumental', 'Track'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], ['Replace'], ['Cancel']]
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1, 2]
 
 
@@ -2019,7 +2019,7 @@ async def test_photo_text_audio_dispatches_to_track_menu() -> None:
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
     _assert_three_rows(reply_markup)
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Instrumental', 'Track'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], ['Replace'], ['Cancel']]
 
 
 @pytest.mark.asyncio
@@ -2044,7 +2044,7 @@ async def test_photo_and_text_batch_dispatches_to_track_menu() -> None:
     ).as_kwargs()
     _assert_format_kwargs(message.answer.await_args.kwargs, expected)
     reply_markup = message.answer.await_args.kwargs['reply_markup']
-    assert _keyboard_rows(reply_markup) == [['Store'], ['Instrumental', 'Track'], ['Cancel']]
+    assert _keyboard_rows(reply_markup) == [['Store'], ['Replace'], ['Cancel']]
 
 
 @pytest.mark.asyncio
@@ -2119,7 +2119,7 @@ async def test_try_dispatch_track_intake_shows_menu_without_audio() -> None:
     )
     assert _keyboard_rows(message.answer.await_args.kwargs['reply_markup']) == [
         ['Store'],
-        ['Instrumental', 'Track'],
+        ['Replace'],
         ['Cancel'],
     ]
     assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1]
@@ -2218,15 +2218,91 @@ async def test_try_dispatch_track_intake_shows_menu_with_multiple_pairs() -> Non
     )
     assert _keyboard_rows(message.answer.await_args.kwargs['reply_markup']) == [
         ['Store'],
-        ['Instrumental', 'Track'],
+        ['Replace'],
         ['Cancel'],
     ]
-    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [
-        1,
-        2,
-        3,
-        4,
+
+
+@pytest.mark.asyncio
+async def test_track_intake_replace_opens_replace_submenu_without_flushing() -> None:
+    message = _fake_message(text='Select action:', chat_id=42, message_id=14)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(_fake_message(chat_id=42, message_id=1, text='note'), chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_track_intake_action(
+        callback,
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.REPLACE,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        _settings(),
+    )
+
+    callback.answer.assert_awaited_once()
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        {
+            **Text(
+                create_padding_line(_settings().message_width),
+                '\n',
+                Text('Messages: ', Bold('1')),
+            ).as_kwargs(),
+            'reply_markup': message.edit_text.await_args.kwargs['reply_markup'],
+        },
+    )
+    assert _keyboard_rows(message.edit_text.await_args.kwargs['reply_markup']) == [
+        ['Track'],
+        ['Instrumental'],
+        ['Back'],
     ]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1]
+    assert state.clear_count == 0
+
+
+@pytest.mark.asyncio
+async def test_track_intake_back_returns_to_root_menu_without_flushing() -> None:
+    message = _fake_message(text='Select action:', chat_id=42, message_id=14)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(_fake_message(chat_id=42, message_id=1, text='note'), chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_track_intake_action(
+        callback,
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.BACK,
+            buffer_version=buffer.version(42),
+        ),
+        state,
+        services,
+        _settings(),
+    )
+
+    callback.answer.assert_awaited_once()
+    _assert_format_kwargs(
+        message.edit_text.await_args.kwargs,
+        {
+            **Text(
+                create_padding_line(_settings().message_width),
+                '\n',
+                Text('Messages: ', Bold('1')),
+            ).as_kwargs(),
+            'reply_markup': message.edit_text.await_args.kwargs['reply_markup'],
+        },
+    )
+    assert _keyboard_rows(message.edit_text.await_args.kwargs['reply_markup']) == [
+        ['Store'],
+        ['Replace'],
+        ['Cancel'],
+    ]
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1]
+    assert state.clear_count == 0
 
 
 @pytest.mark.asyncio
@@ -3014,6 +3090,68 @@ async def test_track_intake_cancel_becomes_stale_when_buffer_version_changes() -
         callback,
         TrackIntakeActionCallbackData(
             action=TrackIntakeAction.CANCEL,
+            buffer_version=rendered_version,
+        ),
+        state,
+        services,
+        _settings(),
+    )
+
+    callback.answer.assert_awaited_once()
+    message.edit_text.assert_awaited_once_with('Selection is no longer available', reply_markup=None)
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1, 2]
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_track_intake_replace_becomes_stale_when_buffer_version_changes() -> None:
+    message = _fake_message(text='Select action:', chat_id=42, message_id=16)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=42, message_id=1, audio=_fake_audio(file_id='audio-1', file_name='a.mp3')), chat_id=42
+    )
+    rendered_version = buffer.version(42)
+    buffer.append(_fake_message(chat_id=42, message_id=2, text='newer'), chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_track_intake_action(
+        callback,
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.REPLACE,
+            buffer_version=rendered_version,
+        ),
+        state,
+        services,
+        _settings(),
+    )
+
+    callback.answer.assert_awaited_once()
+    message.edit_text.assert_awaited_once_with('Selection is no longer available', reply_markup=None)
+    assert [buffered_message.message_id for buffered_message in services.chat_message_buffer.peek_raw(42)] == [1, 2]
+    assert state.current_state is None
+    assert state.clear_count == 1
+
+
+@pytest.mark.asyncio
+async def test_track_intake_back_becomes_stale_when_buffer_version_changes() -> None:
+    message = _fake_message(text='Select action:', chat_id=42, message_id=16)
+    callback = _fake_callback(message)
+    state = _FakeState()
+    buffer = ChatMessageBuffer()
+    buffer.append(
+        _fake_message(chat_id=42, message_id=1, audio=_fake_audio(file_id='audio-1', file_name='a.mp3')), chat_id=42
+    )
+    rendered_version = buffer.version(42)
+    buffer.append(_fake_message(chat_id=42, message_id=2, text='newer'), chat_id=42)
+    services = _services(clip_store=SimpleNamespace(), buffer=buffer)
+
+    await on_track_intake_action(
+        callback,
+        TrackIntakeActionCallbackData(
+            action=TrackIntakeAction.BACK,
             buffer_version=rendered_version,
         ),
         state,

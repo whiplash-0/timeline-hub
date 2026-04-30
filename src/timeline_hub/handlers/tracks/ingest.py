@@ -53,8 +53,10 @@ _TRACK_BACK_VALUE = 'back'
 
 class TrackIntakeAction(StrEnum):
     STORE = auto()
+    REPLACE = auto()
     TRACK = auto()
     INSTRUMENTAL = auto()
+    BACK = auto()
     CANCEL = auto()
 
 
@@ -113,6 +115,26 @@ async def on_track_intake_action(
         await state.clear()
         await message.edit_text('Canceled', reply_markup=None)
         services.chat_message_buffer.flush(message.chat.id)
+        return
+
+    if callback_data.action is TrackIntakeAction.REPLACE:
+        await message.edit_text(
+            **_track_replace_menu_kwargs(
+                message_width=settings.message_width,
+                buffer_version=callback_data.buffer_version,
+                message_count=len(services.chat_message_buffer.peek_flat(message.chat.id)),
+            )
+        )
+        return
+
+    if callback_data.action is TrackIntakeAction.BACK:
+        await message.edit_text(
+            **_track_intake_menu_kwargs(
+                message_width=settings.message_width,
+                buffer_version=callback_data.buffer_version,
+                message_count=len(services.chat_message_buffer.peek_flat(message.chat.id)),
+            )
+        )
         return
 
     if callback_data.action in (TrackIntakeAction.TRACK, TrackIntakeAction.INSTRUMENTAL):
@@ -289,6 +311,39 @@ def _track_intake_menu_kwargs(
                     ).pack(),
                 ),
                 InlineKeyboardButton(
+                    text='Replace',
+                    callback_data=TrackIntakeActionCallbackData(
+                        action=TrackIntakeAction.REPLACE,
+                        buffer_version=buffer_version,
+                    ).pack(),
+                ),
+            ],
+            back_button=InlineKeyboardButton(
+                text='Cancel',
+                callback_data=TrackIntakeActionCallbackData(
+                    action=TrackIntakeAction.CANCEL,
+                    buffer_version=buffer_version,
+                ).pack(),
+            ),
+        ),
+    }
+
+
+def _track_replace_menu_kwargs(
+    *,
+    message_width: int,
+    buffer_version: int,
+    message_count: int,
+) -> dict[str, Any]:
+    return {
+        **Text(
+            create_padding_line(message_width),
+            '\n',
+            Text('Messages: ', Bold(str(message_count))),
+        ).as_kwargs(),
+        'reply_markup': selection_keyboard(
+            buttons=[
+                InlineKeyboardButton(
                     text='Track',
                     callback_data=TrackIntakeActionCallbackData(
                         action=TrackIntakeAction.TRACK,
@@ -304,9 +359,9 @@ def _track_intake_menu_kwargs(
                 ),
             ],
             back_button=InlineKeyboardButton(
-                text='Cancel',
+                text='Back',
                 callback_data=TrackIntakeActionCallbackData(
-                    action=TrackIntakeAction.CANCEL,
+                    action=TrackIntakeAction.BACK,
                     buffer_version=buffer_version,
                 ).pack(),
             ),
