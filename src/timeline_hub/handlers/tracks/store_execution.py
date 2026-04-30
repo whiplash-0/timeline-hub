@@ -25,6 +25,15 @@ def extract_single_photo_audio_messages(messages: Sequence[Message]) -> tuple[Me
     return photo_messages[0], audio_messages[0]
 
 
+def extract_photo_messages_for_remove(messages: Sequence[Message]) -> tuple[Message, ...]:
+    """Return one or more photo messages for remove actions."""
+    if len(messages) < 1:
+        raise TrackInputError('Invalid input')
+    if any(message.photo is None for message in messages):
+        raise TrackInputError('Invalid input')
+    return tuple(messages)
+
+
 def extract_track_identity_from_photo_message(photo_message: Message) -> tuple[TrackGroup, TrackId]:
     """Decode linked-dot cover caption identity into `(group, track_id)`."""
     caption = photo_message.caption

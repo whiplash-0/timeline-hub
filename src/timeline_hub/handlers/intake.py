@@ -57,7 +57,7 @@ async def on_buffered_relevant_message(
             )
             if handled:
                 return
-        elif has_photo and message_count >= 2:
+        elif has_photo:
             handled = await try_dispatch_track_intake(
                 message=message,
                 services=services,

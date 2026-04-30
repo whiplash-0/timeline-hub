@@ -202,6 +202,16 @@ Rules:
 - UI may reorder or group values for usability
 - UI transformations must not affect storage, parsing, or business logic
 
+## Action menu contract
+
+Root action menus intentionally show all high-level actions.
+
+Rules:
+- do not hide or disable root actions based on current buffered input shape
+- each action validates its own input when clicked
+- invalid action input must invalidate the active menu with exactly `Invalid input` and remove buttons
+- submenus may be contextual, but root visibility must not duplicate action-level validation
+
 # Repository Agent Rules
 
 ## Tooling

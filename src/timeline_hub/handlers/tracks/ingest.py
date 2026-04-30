@@ -24,6 +24,7 @@ from timeline_hub.handlers.menu import (
 )
 from timeline_hub.handlers.tracks.store_execution import (
     TrackInputError,
+    extract_photo_messages_for_remove,
     extract_single_photo_audio_messages,
     extract_track_identity_from_photo_message,
     prepare_audio_from_message,
@@ -40,6 +41,7 @@ from timeline_hub.services.track_store import (
     TrackInvalidAudioFormatError,
     TrackManifestCorruptedError,
     TrackPresetsCorruptedError,
+    TrackRemoveManifestSyncError,
     TrackUniverse,
     TrackUpdateManifestSyncError,
 )
@@ -54,8 +56,11 @@ _TRACK_BACK_VALUE = 'back'
 class TrackIntakeAction(StrEnum):
     STORE = auto()
     REPLACE = auto()
+    REMOVE = auto()
     TRACK = auto()
     INSTRUMENTAL = auto()
+    REMOVE_TRACK = auto()
+    REMOVE_INSTRUMENTAL = auto()
     BACK = auto()
     CANCEL = auto()
 
@@ -130,6 +135,15 @@ async def on_track_intake_action(
         )
         return
 
+    if callback_data.action is TrackIntakeAction.REMOVE:
+        await message.edit_text(
+            **_track_remove_menu_kwargs(
+                message_width=settings.message_width,
+                buffer_version=callback_data.buffer_version,
+            )
+        )
+        return
+
     if callback_data.action is TrackIntakeAction.BACK:
         await message.edit_text(
             **_track_intake_menu_kwargs(
@@ -151,6 +165,16 @@ async def on_track_intake_action(
             services=services,
             action=callback_data.action,
             bot=bot,
+            expected_buffer_version=callback_data.buffer_version,
+        )
+        return
+
+    if callback_data.action in (TrackIntakeAction.REMOVE_TRACK, TrackIntakeAction.REMOVE_INSTRUMENTAL):
+        await _execute_track_remove(
+            message=message,
+            state=state,
+            services=services,
+            action=callback_data.action,
             expected_buffer_version=callback_data.buffer_version,
         )
         return
@@ -321,6 +345,13 @@ def _track_intake_menu_kwargs(
                         buffer_version=buffer_version,
                     ).pack(),
                 ),
+                InlineKeyboardButton(
+                    text='Remove',
+                    callback_data=TrackIntakeActionCallbackData(
+                        action=TrackIntakeAction.REMOVE,
+                        buffer_version=buffer_version,
+                    ).pack(),
+                ),
             ],
             back_button=InlineKeyboardButton(
                 text='Cancel',
@@ -359,6 +390,46 @@ def _track_replace_menu_kwargs(
                     text='Instrumental',
                     callback_data=TrackIntakeActionCallbackData(
                         action=TrackIntakeAction.INSTRUMENTAL,
+                        buffer_version=buffer_version,
+                    ).pack(),
+                ),
+            ],
+            back_button=InlineKeyboardButton(
+                text='Back',
+                callback_data=TrackIntakeActionCallbackData(
+                    action=TrackIntakeAction.BACK,
+                    buffer_version=buffer_version,
+                ).pack(),
+            ),
+        ),
+    }
+
+
+def _track_remove_menu_kwargs(
+    *,
+    message_width: int,
+    buffer_version: int,
+) -> dict[str, Any]:
+    return {
+        **Text(
+            create_padding_line(message_width),
+            '\n',
+            'Selected: ',
+            Bold('Remove'),
+        ).as_kwargs(),
+        'reply_markup': selection_keyboard(
+            buttons=[
+                InlineKeyboardButton(
+                    text='Track',
+                    callback_data=TrackIntakeActionCallbackData(
+                        action=TrackIntakeAction.REMOVE_TRACK,
+                        buffer_version=buffer_version,
+                    ).pack(),
+                ),
+                InlineKeyboardButton(
+                    text='Instrumental',
+                    callback_data=TrackIntakeActionCallbackData(
+                        action=TrackIntakeAction.REMOVE_INSTRUMENTAL,
                         buffer_version=buffer_version,
                     ).pack(),
                 ),
@@ -774,6 +845,79 @@ async def _execute_track_update(
     await message.answer('Done')
 
 
+async def _execute_track_remove(
+    *,
+    message: Message,
+    state: FSMContext,
+    services: Services,
+    action: TrackIntakeAction,
+    expected_buffer_version: int,
+) -> None:
+    chat_id = message.chat.id
+    buffered_messages = services.chat_message_buffer.peek_flat(chat_id)
+    owns_buffer = False
+    try:
+        photo_messages = extract_photo_messages_for_remove(buffered_messages)
+        targets = [extract_track_identity_from_photo_message(photo_message) for photo_message in photo_messages]
+        if len(set(targets)) != len(targets):
+            raise TrackInputError('Invalid input')
+        tracks_by_group: dict[TrackGroup, dict[SubSeason, list[TrackInfo]]] = {}
+        for group, track_id in targets:
+            if group not in tracks_by_group:
+                tracks_by_group[group] = await services.track_store.list_tracks(group)
+            if _resolve_track_sub_season(tracks_by_group[group], track_id) is None:
+                raise TrackInputError('Invalid input')
+        if services.chat_message_buffer.version(chat_id) != expected_buffer_version:
+            await handle_stale_selection(message=message, state=state)
+            return
+
+        services.chat_message_buffer.flush(chat_id)
+        await state.clear()
+        owns_buffer = True
+        action_label = 'Track' if action is TrackIntakeAction.REMOVE_TRACK else 'Instrumental'
+        await message.edit_text(
+            **selected_text(selected=['Remove', action_label]),
+            reply_markup=None,
+        )
+
+        for group, track_id in targets:
+            if action is TrackIntakeAction.REMOVE_TRACK:
+                await services.track_store.remove(group, track_id)
+            else:
+                await services.track_store.remove_instrumental(group, track_id)
+    except (
+        TrackInputError,
+        InvalidTrackIdentityError,
+        TrackGroupNotFoundError,
+    ):
+        await _invalidate_track_intake_buffer(
+            message=message,
+            state=state,
+            services=services,
+            text='Invalid input',
+            flush_buffer=not owns_buffer,
+        )
+        return
+    except ValueError as error:
+        if _is_missing_track_error(error) or _is_missing_instrumental_error(error):
+            await _invalidate_track_intake_buffer(
+                message=message,
+                state=state,
+                services=services,
+                text='Invalid input',
+                flush_buffer=not owns_buffer,
+            )
+            return
+        raise
+    except (
+        TrackRemoveManifestSyncError,
+        TrackManifestCorruptedError,
+    ):
+        raise
+
+    await message.answer('Done')
+
+
 async def _invalidate_track_intake_buffer(
     *,
     message: Message,
@@ -896,6 +1040,10 @@ def _selected_store_path(
 
 def _is_missing_track_error(error: ValueError) -> bool:
     return str(error).startswith('Track id ') and ' does not exist in group ' in str(error)
+
+
+def _is_missing_instrumental_error(error: ValueError) -> bool:
+    return str(error).startswith('Track id ') and ' does not have an instrumental in the provided group' in str(error)
 
 
 def _resolve_track_sub_season(
