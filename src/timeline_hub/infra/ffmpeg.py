@@ -166,8 +166,8 @@ async def create_audio_variant(
         raise ValueError('mp3_quality must be in 0..9')
 
     if output_format == 'opus':
-        output_suffix = '.opus'
         output_sample_rate = 48_000
+        output_muxer = 'opus'
         codec_args = (
             '-c:a',
             'libopus',
@@ -179,83 +179,72 @@ async def create_audio_variant(
             '10',
         )
     else:
-        output_suffix = '.mp3'
         output_sample_rate = 48_000
+        output_muxer = 'mp3'
         codec_args = (
             '-c:a',
             'libmp3lame',
             '-q:a',
             str(mp3_quality),
         )
+    filter_parts = [
+        f'asetrate={input_sample_rate}*{speed}',
+        f'aresample={output_sample_rate}:resampler=soxr:precision=28:cheby=1',
+    ]
 
-    input_fd, input_name = tempfile.mkstemp(suffix='.audio')
-    output_fd, output_name = tempfile.mkstemp(suffix=output_suffix)
-    os.close(input_fd)
-    os.close(output_fd)
-
-    input_path = Path(input_name)
-    output_path = Path(output_name)
-
-    try:
-        input_path.write_bytes(audio_bytes)
-
-        filter_parts = [
-            f'asetrate={input_sample_rate}*{speed}',
-            f'aresample={output_sample_rate}:resampler=soxr:precision=28:cheby=1',
-        ]
-
-        if speed < 1.0:
-            filter_parts.extend(
-                [
-                    'equalizer=f=5000:t=q:w=1:g=1',
-                    'equalizer=f=14000:t=q:w=1:g=-2',
-                ]
-            )
-        else:
-            fast_volume = 1.0 + (speed - 1.0) * 0.5
-            filter_parts.extend(
-                [
-                    'equalizer=f=5000:t=q:w=1:g=2',
-                    'equalizer=f=14000:t=q:w=1:g=-2',
-                    f'volume={fast_volume}',
-                    'alimiter=limit=0.98',
-                ]
-            )
-
-        effective_reverb = reverb * 2.0
-        if effective_reverb > 0:
-            echo_decay = min(max(effective_reverb, 0.001), 0.98)
-            filter_parts.append(f'aecho=1.0:0.95:50:{echo_decay}')
-
-        audio_filter = ','.join(filter_parts)
-
-        cmd = (
-            'ffmpeg',
-            '-hide_banner',
-            '-loglevel',
-            'error',
-            '-nostats',
-            '-nostdin',
-            '-y',
-            '-threads',
-            '1',
-            '-i',
-            str(input_path),
-            '-vn',
-            '-af',
-            audio_filter,
-            '-ar',
-            str(output_sample_rate),
-            *codec_args,
-            str(output_path),
+    if speed < 1.0:
+        filter_parts.extend(
+            [
+                'equalizer=f=5000:t=q:w=1:g=1',
+                'equalizer=f=14000:t=q:w=1:g=-2',
+            ]
         )
-        await _run_ffmpeg(cmd, timeout)
+    else:
+        fast_volume = 1.0 + (speed - 1.0) * 0.5
+        filter_parts.extend(
+            [
+                'equalizer=f=5000:t=q:w=1:g=2',
+                'equalizer=f=14000:t=q:w=1:g=-2',
+                f'volume={fast_volume}',
+                'alimiter=limit=0.98',
+            ]
+        )
 
-        return output_path.read_bytes()
+    effective_reverb = reverb * 2.0
+    if effective_reverb > 0:
+        echo_decay = min(max(effective_reverb, 0.001), 0.98)
+        filter_parts.append(f'aecho=1.0:0.95:50:{echo_decay}')
 
-    finally:
-        input_path.unlink(missing_ok=True)
-        output_path.unlink(missing_ok=True)
+    audio_filter = ','.join(filter_parts)
+
+    cmd = (
+        'ffmpeg',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-nostats',
+        '-nostdin',
+        '-y',
+        '-threads',
+        '1',
+        '-i',
+        'pipe:0',
+        '-vn',
+        '-af',
+        audio_filter,
+        '-ar',
+        str(output_sample_rate),
+        *codec_args,
+        '-f',
+        output_muxer,
+        'pipe:1',
+    )
+    return await _run_ffmpeg(
+        cmd,
+        timeout,
+        stdin_bytes=audio_bytes,
+        capture='stdout',
+    )
 
 
 async def probe_audio_sample_rate(
@@ -381,7 +370,7 @@ async def normalize_video_audio_loudness(
             'null',
             '-',
         )
-        analysis_stderr = await _run_ffmpeg(analysis_cmd, timeout)
+        analysis_stderr = await _run_ffmpeg(analysis_cmd, timeout, capture='stderr')
 
         analysis_text = analysis_stderr.decode(errors='replace')
         json_start = analysis_text.rfind('{')
@@ -422,7 +411,7 @@ async def normalize_video_audio_loudness(
             f'{bitrate}k',
             str(output_path),
         )
-        await _run_ffmpeg(normalize_cmd, timeout)
+        await _run_ffmpeg(normalize_cmd, timeout, capture='none')
 
         return output_path.read_bytes()
 
@@ -508,16 +497,25 @@ async def hash_video_content(
         input_path.unlink(missing_ok=True)
 
 
-async def _run_ffmpeg(cmd: tuple[str, ...], timeout: timedelta) -> bytes:
+async def _run_ffmpeg(
+    cmd: tuple[str, ...],
+    timeout: timedelta,
+    *,
+    stdin_bytes: bytes | None = None,
+    capture: Literal['none', 'stdout', 'stderr'] = 'none',
+) -> bytes:
+    input_data = stdin_bytes if stdin_bytes is not None else None
+    stdout_target = asyncio.subprocess.PIPE if capture == 'stdout' else asyncio.subprocess.DEVNULL
     proc = await asyncio.create_subprocess_exec(
         *cmd,
-        stdout=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.PIPE if input_data is not None else None,
+        stdout=stdout_target,
         stderr=asyncio.subprocess.PIPE,
     )
 
     try:
-        _, stderr = await asyncio.wait_for(
-            proc.communicate(),
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input_data),
             timeout=timeout.total_seconds(),
         )
     except asyncio.TimeoutError:
@@ -529,7 +527,15 @@ async def _run_ffmpeg(cmd: tuple[str, ...], timeout: timedelta) -> bytes:
         stderr_text = stderr.decode(errors='replace')
         raise RuntimeError(f'ffmpeg failed: {stderr_text}')
 
-    return stderr
+    if capture == 'stdout':
+        if not stdout:
+            raise RuntimeError('ffmpeg produced empty stdout')
+        return stdout
+    if capture == 'stderr':
+        if not stderr:
+            raise RuntimeError('ffmpeg produced empty stderr')
+        return stderr
+    return b''
 
 
 async def _hash_stream(stream: asyncio.StreamReader, hasher: Any) -> None:

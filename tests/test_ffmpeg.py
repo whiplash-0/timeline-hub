@@ -2,7 +2,6 @@ import math
 import wave
 from datetime import timedelta
 from io import BytesIO
-from pathlib import Path
 
 import pytest
 
@@ -61,13 +60,20 @@ async def test_create_audio_variant_rejects_out_of_range_mp3_quality() -> None:
 async def test_create_audio_variant_builds_slowdown_filter_without_reverb(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    observed: dict[str, tuple[str, ...] | timedelta] = {}
+    observed: dict[str, object] = {}
 
-    async def _fake_run_ffmpeg(cmd: tuple[str, ...], timeout: timedelta) -> bytes:
+    async def _fake_run_ffmpeg(
+        cmd: tuple[str, ...],
+        timeout: timedelta,
+        *,
+        stdin_bytes: bytes | None = None,
+        capture: str = 'none',
+    ) -> bytes:
         observed['cmd'] = cmd
         observed['run_timeout'] = timeout
-        Path(cmd[-1]).write_bytes(b'variant-audio')
-        return b''
+        observed['stdin_bytes'] = stdin_bytes
+        observed['capture'] = capture
+        return b'variant-audio'
 
     monkeypatch.setattr(ffmpeg_module, '_run_ffmpeg', _fake_run_ffmpeg)
 
@@ -83,6 +89,8 @@ async def test_create_audio_variant_builds_slowdown_filter_without_reverb(
 
     assert result == b'variant-audio'
     assert observed['run_timeout'] == timedelta(seconds=12)
+    assert observed['stdin_bytes'] == b'source-audio'
+    assert observed['capture'] == 'stdout'
     assert observed['cmd'] == (
         'ffmpeg',
         '-hide_banner',
@@ -94,7 +102,7 @@ async def test_create_audio_variant_builds_slowdown_filter_without_reverb(
         '-threads',
         '1',
         '-i',
-        observed['cmd'][10],
+        'pipe:0',
         '-vn',
         '-af',
         'asetrate=44100*0.75,aresample=48000:resampler=soxr:precision=28:cheby=1,'
@@ -109,7 +117,9 @@ async def test_create_audio_variant_builds_slowdown_filter_without_reverb(
         'on',
         '-compression_level',
         '10',
-        observed['cmd'][-1],
+        '-f',
+        'opus',
+        'pipe:1',
     )
 
 
@@ -119,11 +129,18 @@ async def test_create_audio_variant_builds_speedup_filter_with_reverb(
 ) -> None:
     observed_cmds: list[tuple[str, ...]] = []
 
-    async def _fake_run_ffmpeg(cmd: tuple[str, ...], timeout: timedelta) -> bytes:
+    async def _fake_run_ffmpeg(
+        cmd: tuple[str, ...],
+        timeout: timedelta,
+        *,
+        stdin_bytes: bytes | None = None,
+        capture: str = 'none',
+    ) -> bytes:
         observed_cmds.append(cmd)
         assert timeout == timedelta(seconds=5)
-        Path(cmd[-1]).write_bytes(b'variant-audio')
-        return b''
+        assert stdin_bytes == b'source-audio'
+        assert capture == 'stdout'
+        return b'variant-audio'
 
     monkeypatch.setattr(ffmpeg_module, '_run_ffmpeg', _fake_run_ffmpeg)
 
@@ -149,7 +166,7 @@ async def test_create_audio_variant_builds_speedup_filter_with_reverb(
             '-threads',
             '1',
             '-i',
-            observed_cmds[0][10],
+            'pipe:0',
             '-vn',
             '-af',
             'asetrate=48000*1.25,aresample=48000:resampler=soxr:precision=28:cheby=1,'
@@ -165,7 +182,9 @@ async def test_create_audio_variant_builds_speedup_filter_with_reverb(
             'on',
             '-compression_level',
             '10',
-            observed_cmds[0][-1],
+            '-f',
+            'opus',
+            'pipe:1',
         )
     ]
 
@@ -174,13 +193,20 @@ async def test_create_audio_variant_builds_speedup_filter_with_reverb(
 async def test_create_audio_variant_builds_mp3_output_args(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    observed: dict[str, tuple[str, ...] | timedelta] = {}
+    observed: dict[str, object] = {}
 
-    async def _fake_run_ffmpeg(cmd: tuple[str, ...], timeout: timedelta) -> bytes:
+    async def _fake_run_ffmpeg(
+        cmd: tuple[str, ...],
+        timeout: timedelta,
+        *,
+        stdin_bytes: bytes | None = None,
+        capture: str = 'none',
+    ) -> bytes:
         observed['cmd'] = cmd
         observed['run_timeout'] = timeout
-        Path(cmd[-1]).write_bytes(b'variant-audio')
-        return b''
+        observed['stdin_bytes'] = stdin_bytes
+        observed['capture'] = capture
+        return b'variant-audio'
 
     monkeypatch.setattr(ffmpeg_module, '_run_ffmpeg', _fake_run_ffmpeg)
 
@@ -195,6 +221,8 @@ async def test_create_audio_variant_builds_mp3_output_args(
 
     assert result == b'variant-audio'
     assert observed['run_timeout'] == timedelta(seconds=7)
+    assert observed['stdin_bytes'] == b'source-audio'
+    assert observed['capture'] == 'stdout'
     assert observed['cmd'] == (
         'ffmpeg',
         '-hide_banner',
@@ -206,7 +234,7 @@ async def test_create_audio_variant_builds_mp3_output_args(
         '-threads',
         '1',
         '-i',
-        observed['cmd'][10],
+        'pipe:0',
         '-vn',
         '-af',
         'asetrate=48000*1.0,aresample=48000:resampler=soxr:precision=28:cheby=1,'
@@ -218,7 +246,9 @@ async def test_create_audio_variant_builds_mp3_output_args(
         'libmp3lame',
         '-q:a',
         '1',
-        observed['cmd'][-1],
+        '-f',
+        'mp3',
+        'pipe:1',
     )
 
 
@@ -226,13 +256,20 @@ async def test_create_audio_variant_builds_mp3_output_args(
 async def test_create_audio_variant_builds_mp3_output_args_with_custom_quality(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    observed: dict[str, tuple[str, ...] | timedelta] = {}
+    observed: dict[str, object] = {}
 
-    async def _fake_run_ffmpeg(cmd: tuple[str, ...], timeout: timedelta) -> bytes:
+    async def _fake_run_ffmpeg(
+        cmd: tuple[str, ...],
+        timeout: timedelta,
+        *,
+        stdin_bytes: bytes | None = None,
+        capture: str = 'none',
+    ) -> bytes:
         observed['cmd'] = cmd
         observed['run_timeout'] = timeout
-        Path(cmd[-1]).write_bytes(b'variant-audio')
-        return b''
+        observed['stdin_bytes'] = stdin_bytes
+        observed['capture'] = capture
+        return b'variant-audio'
 
     monkeypatch.setattr(ffmpeg_module, '_run_ffmpeg', _fake_run_ffmpeg)
 
@@ -248,6 +285,8 @@ async def test_create_audio_variant_builds_mp3_output_args_with_custom_quality(
 
     assert result == b'variant-audio'
     assert observed['run_timeout'] == timedelta(seconds=7)
+    assert observed['stdin_bytes'] == b'source-audio'
+    assert observed['capture'] == 'stdout'
     assert observed['cmd'] == (
         'ffmpeg',
         '-hide_banner',
@@ -259,7 +298,7 @@ async def test_create_audio_variant_builds_mp3_output_args_with_custom_quality(
         '-threads',
         '1',
         '-i',
-        observed['cmd'][10],
+        'pipe:0',
         '-vn',
         '-af',
         'asetrate=48000*1.0,aresample=48000:resampler=soxr:precision=28:cheby=1,'
@@ -271,8 +310,200 @@ async def test_create_audio_variant_builds_mp3_output_args_with_custom_quality(
         'libmp3lame',
         '-q:a',
         '4',
-        observed['cmd'][-1],
+        '-f',
+        'mp3',
+        'pipe:1',
     )
+
+
+@pytest.mark.asyncio
+async def test_create_audio_variant_pipe_execution_returns_non_empty_output() -> None:
+    audio_bytes = _build_wav_bytes(sample_rate=44_100)
+
+    variant_bytes = await ffmpeg_module.create_audio_variant(
+        audio_bytes,
+        speed=1.0,
+        reverb=0.0,
+        input_sample_rate=44_100,
+        output_format='opus',
+    )
+
+    assert variant_bytes
+    assert variant_bytes.startswith(b'OggS')
+
+
+@pytest.mark.asyncio
+async def test_create_audio_variant_pipe_failure_propagates_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_run_ffmpeg(
+        cmd: tuple[str, ...],
+        timeout: timedelta,
+        *,
+        stdin_bytes: bytes | None = None,
+        capture: str = 'none',
+    ) -> bytes:
+        raise RuntimeError('ffmpeg failed: broken input')
+
+    monkeypatch.setattr(ffmpeg_module, '_run_ffmpeg', _fake_run_ffmpeg)
+
+    with pytest.raises(RuntimeError, match='ffmpeg failed: broken input'):
+        await ffmpeg_module.create_audio_variant(
+            b'source-audio',
+            speed=1.0,
+            reverb=0.0,
+            input_sample_rate=48_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_audio_variant_pipe_empty_output_raises_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.returncode = 0
+
+        async def communicate(self, input_data: bytes | None = None) -> tuple[bytes, bytes]:
+            return b'', b''
+
+        def kill(self) -> None:
+            return None
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    async def _fake_create_subprocess_exec(*args: str, **kwargs: object) -> _FakeProc:
+        return _FakeProc()
+
+    monkeypatch.setattr(ffmpeg_module.asyncio, 'create_subprocess_exec', _fake_create_subprocess_exec)
+
+    with pytest.raises(RuntimeError, match='ffmpeg produced empty stdout'):
+        await ffmpeg_module.create_audio_variant(
+            b'source-audio',
+            speed=1.0,
+            reverb=0.0,
+            input_sample_rate=48_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_ffmpeg_capture_none_returns_empty_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeProc:
+        returncode = 0
+
+        async def communicate(self, input_data: bytes | None = None) -> tuple[bytes, bytes]:
+            return b'', b'info-on-stderr'
+
+        def kill(self) -> None:
+            return None
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    async def _fake_create_subprocess_exec(*args: str, **kwargs: object) -> _FakeProc:
+        return _FakeProc()
+
+    monkeypatch.setattr(ffmpeg_module.asyncio, 'create_subprocess_exec', _fake_create_subprocess_exec)
+
+    result = await ffmpeg_module._run_ffmpeg(('ffmpeg',), timedelta(seconds=1), capture='none')
+    assert result == b''
+
+
+@pytest.mark.asyncio
+async def test_run_ffmpeg_capture_stdout_returns_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeProc:
+        returncode = 0
+
+        async def communicate(self, input_data: bytes | None = None) -> tuple[bytes, bytes]:
+            return b'encoded', b''
+
+        def kill(self) -> None:
+            return None
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    async def _fake_create_subprocess_exec(*args: str, **kwargs: object) -> _FakeProc:
+        return _FakeProc()
+
+    monkeypatch.setattr(ffmpeg_module.asyncio, 'create_subprocess_exec', _fake_create_subprocess_exec)
+
+    result = await ffmpeg_module._run_ffmpeg(('ffmpeg',), timedelta(seconds=1), capture='stdout')
+    assert result == b'encoded'
+
+
+@pytest.mark.asyncio
+async def test_run_ffmpeg_capture_stderr_returns_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeProc:
+        returncode = 0
+
+        async def communicate(self, input_data: bytes | None = None) -> tuple[bytes, bytes]:
+            return b'', b'analysis-json'
+
+        def kill(self) -> None:
+            return None
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    async def _fake_create_subprocess_exec(*args: str, **kwargs: object) -> _FakeProc:
+        return _FakeProc()
+
+    monkeypatch.setattr(ffmpeg_module.asyncio, 'create_subprocess_exec', _fake_create_subprocess_exec)
+
+    result = await ffmpeg_module._run_ffmpeg(('ffmpeg',), timedelta(seconds=1), capture='stderr')
+    assert result == b'analysis-json'
+
+
+@pytest.mark.asyncio
+async def test_normalize_video_audio_loudness_uses_stderr_capture_for_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    loudnorm_json = (
+        '{"input_i":"-20.1","input_tp":"-1.0","input_lra":"3.0","input_thresh":"-30.0","target_offset":"0.5"}'
+    )
+
+    async def _fake_run_ffmpeg(
+        cmd: tuple[str, ...],
+        timeout: timedelta,
+        *,
+        stdin_bytes: bytes | None = None,
+        capture: str = 'none',
+    ) -> bytes:
+        calls.append({'cmd': cmd, 'capture': capture, 'timeout': timeout, 'stdin_bytes': stdin_bytes})
+        if len(calls) == 1:
+            return loudnorm_json.encode()
+        return b''
+
+    monkeypatch.setattr(ffmpeg_module, '_run_ffmpeg', _fake_run_ffmpeg)
+
+    class _FakePath:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        def write_bytes(self, data: bytes) -> int:
+            return len(data)
+
+        def read_bytes(self) -> bytes:
+            return b'normalized-video'
+
+        def unlink(self, missing_ok: bool = False) -> None:
+            return None
+
+        def __str__(self) -> str:
+            return self._name
+
+    monkeypatch.setattr(ffmpeg_module, 'Path', _FakePath)
+    monkeypatch.setattr(ffmpeg_module.tempfile, 'mkstemp', lambda suffix='': (0, f'/tmp/fake{suffix}'))
+    monkeypatch.setattr(ffmpeg_module.os, 'close', lambda fd: None)
+
+    result = await ffmpeg_module.normalize_video_audio_loudness(b'video-bytes')
+
+    assert result == b'normalized-video'
+    assert calls[0]['capture'] == 'stderr'
+    assert calls[1]['capture'] == 'none'
 
 
 @pytest.mark.asyncio
