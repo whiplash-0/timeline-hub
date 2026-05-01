@@ -1521,6 +1521,7 @@ async def test_list_tracks_groups_by_sub_season_with_none_first() -> None:
         SubSeason.NONE: [
             TrackInfo(
                 id=_UUID_2,
+                album_id=_UUID_2,
                 artists=('artist',),
                 title='title',
                 has_instrumental=True,
@@ -1529,12 +1530,14 @@ async def test_list_tracks_groups_by_sub_season_with_none_first() -> None:
         SubSeason.B: [
             TrackInfo(
                 id=_UUID_1,
+                album_id=_UUID_1,
                 artists=('artist',),
                 title='title',
                 has_instrumental=False,
             ),
             TrackInfo(
                 id=_UUID_3,
+                album_id=_UUID_3,
                 artists=('artist',),
                 title='title',
                 has_instrumental=False,
@@ -1621,12 +1624,14 @@ async def test_list_tracks_groups_by_sub_season_and_sorts_by_manifest_order() ->
         SubSeason.A: [
             TrackInfo(
                 id=_UUID_3,
+                album_id=_UUID_3,
                 artists=('artist a', 'artist b'),
                 title='second in manifest, first in order',
                 has_instrumental=True,
             ),
             TrackInfo(
                 id=_UUID_1,
+                album_id=_UUID_1,
                 artists=('artist c',),
                 title='third in manifest, second in order',
                 has_instrumental=False,
@@ -1635,6 +1640,7 @@ async def test_list_tracks_groups_by_sub_season_and_sorts_by_manifest_order() ->
         SubSeason.B: [
             TrackInfo(
                 id=_UUID_2,
+                album_id=_UUID_2,
                 artists=('artist other',),
                 title='other sub-season',
                 has_instrumental=True,
@@ -1671,9 +1677,11 @@ async def test_list_tracks_returns_track_info_with_only_public_discovery_fields(
     result = await store.list_tracks(TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1))
 
     assert result == {
-        SubSeason.NONE: [TrackInfo(id=_UUID_1, artists=('artist',), title='title', has_instrumental=True)]
+        SubSeason.NONE: [
+            TrackInfo(id=_UUID_1, album_id=_UUID_1, artists=('artist',), title='title', has_instrumental=True)
+        ]
     }
-    assert tuple(result[SubSeason.NONE][0].__slots__) == ('id', 'artists', 'title', 'has_instrumental')
+    assert tuple(result[SubSeason.NONE][0].__slots__) == ('id', 'album_id', 'artists', 'title', 'has_instrumental')
 
 
 @pytest.mark.asyncio
@@ -1705,10 +1713,68 @@ async def test_list_tracks_omits_missing_sub_season_for_existing_group() -> None
         SubSeason.A: [
             TrackInfo(
                 id=_UUID_1,
+                album_id=_UUID_1,
                 artists=('artist',),
                 title='title',
                 has_instrumental=False,
             )
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_tracks_exposes_shared_persisted_album_id_across_distinct_tracks() -> None:
+    manifest_key = _manifest_key(universe=TrackUniverse.WEST, year=2024, season=Season.S1)
+    store = _store(
+        _FakeS3Client(
+            objects={
+                _presets_key(): _presets_bytes(),
+                manifest_key: _manifest_bytes(
+                    [
+                        _entry(
+                            id=_UUID_1,
+                            album_id=_UUID_1,
+                            artists=('artist a',),
+                            title='track A',
+                            sub_season=SubSeason.NONE,
+                            order=1,
+                            preset=None,
+                            has_instrumental=False,
+                            has_instrumental_variants=False,
+                        ),
+                        _entry(
+                            id=_UUID_2,
+                            album_id=_UUID_1,
+                            artists=('artist b',),
+                            title='track B',
+                            sub_season=SubSeason.NONE,
+                            order=2,
+                            preset=None,
+                            has_instrumental=False,
+                            has_instrumental_variants=False,
+                        ),
+                    ]
+                ),
+            }
+        )
+    )
+
+    assert await store.list_tracks(TrackGroup(universe=TrackUniverse.WEST, year=2024, season=Season.S1)) == {
+        SubSeason.NONE: [
+            TrackInfo(
+                id=_UUID_1,
+                album_id=_UUID_1,
+                artists=('artist a',),
+                title='track A',
+                has_instrumental=False,
+            ),
+            TrackInfo(
+                id=_UUID_2,
+                album_id=_UUID_1,
+                artists=('artist b',),
+                title='track B',
+                has_instrumental=False,
+            ),
         ]
     }
 

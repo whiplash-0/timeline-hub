@@ -134,9 +134,14 @@ class Track:
 
 @dataclass(frozen=True, slots=True)
 class TrackInfo:
-    """Public discovery metadata for one stored track within a specific sub-season."""
+    """Public discovery metadata for one stored track within a specific sub-season.
+
+    `album_id` is the persisted album-family identifier to reuse when storing
+    a new track that should share this track's cover.
+    """
 
     id: TrackId
+    album_id: TrackId
     artists: tuple[str, ...]
     title: str
     has_instrumental: bool
@@ -1056,6 +1061,8 @@ class TrackStore:
         `SubSeason.order()`. Tracks within each sub-season are ordered by the
         authoritative manifest's ascending internal `order`, but that internal
         `order` is intentionally not exposed in the public return type.
+        Callers should use each returned `TrackInfo.album_id` for cover reuse
+        instead of inferring an album-family id from arbitrary track ids.
 
         Raises:
             TrackPresetsCorruptedError: If `tracks/presets.json` exists but is malformed.
@@ -1070,6 +1077,7 @@ class TrackStore:
             sub_season: [
                 TrackInfo(
                     id=entry.id,
+                    album_id=entry.album_id,
                     artists=entry.artists,
                     title=entry.title,
                     has_instrumental=entry.has_instrumental,
