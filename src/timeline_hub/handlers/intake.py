@@ -14,6 +14,7 @@ from timeline_hub.handlers.menu import (
     single_button_keyboard,
 )
 from timeline_hub.handlers.tracks.ingest import try_dispatch_track_intake
+from timeline_hub.handlers.tracks.store_execution import is_supported_youtube_store_url
 from timeline_hub.services.container import Services
 from timeline_hub.settings import Settings
 
@@ -43,6 +44,7 @@ async def on_buffered_relevant_message(
             buffered_message.video is not None or getattr(buffered_message, 'animation', None) is not None
             for buffered_message in ordered_buffered_messages
         )
+        text_messages = [buffered_message for buffered_message in ordered_buffered_messages if buffered_message.text]
 
         if has_video and (has_photo or has_audio):
             services.chat_message_buffer.flush(chat_id)
@@ -58,6 +60,18 @@ async def on_buffered_relevant_message(
             if handled:
                 return
         elif has_photo or (has_audio and not has_video):
+            handled = await try_dispatch_track_intake(
+                message=message,
+                services=services,
+                settings=settings,
+            )
+            if handled:
+                return
+        elif (
+            len(ordered_buffered_messages) == 1
+            and len(text_messages) == 1
+            and _first_line_is_supported_store_link(text_messages[0].text)
+        ):
             handled = await try_dispatch_track_intake(
                 message=message,
                 services=services,
@@ -88,6 +102,17 @@ async def on_buffered_relevant_message(
         key=chat_id,
         delay=settings.forward_batch_timeout,
     )
+
+
+def _first_line_is_supported_store_link(text: str | None) -> bool:
+    if text is None:
+        return False
+    for raw_line in text.splitlines():
+        first_line = raw_line.strip()
+        if not first_line:
+            continue
+        return is_supported_youtube_store_url(first_line)
+    return False
 
 
 @router.callback_query(

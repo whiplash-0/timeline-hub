@@ -24,14 +24,19 @@ from timeline_hub.handlers.menu import (
 )
 from timeline_hub.handlers.tracks.store_execution import (
     TrackInputError,
+    TrackLinkDownloadError,
+    download_link_audio,
     extract_photo_messages_for_remove,
     extract_single_photo_audio_messages,
     extract_store_messages,
     extract_track_identity_from_photo_message,
+    is_supported_youtube_store_url,
     prepare_audio_from_message,
     prepare_audio_only_track_from_buffer,
+    prepare_link_only_track_from_buffer,
     prepare_tracks_from_buffer,
     validate_audio_only_store_input,
+    validate_link_only_store_input,
     validate_track_batch,
 )
 from timeline_hub.services.container import Services
@@ -39,6 +44,7 @@ from timeline_hub.services.track_store import (
     InvalidTrackIdentityError,
     Season,
     SubSeason,
+    Track,
     TrackGroup,
     TrackGroupNotFoundError,
     TrackInfo,
@@ -894,7 +900,10 @@ async def _on_store_sub_season_selected(
         return
 
     try:
-        _ = validate_audio_only_store_input(buffered_messages)
+        try:
+            _ = validate_audio_only_store_input(buffered_messages)
+        except TrackInputError:
+            _ = validate_link_only_store_input(buffered_messages)
         await _show_store_album_menu(
             message=message,
             state=state,
@@ -947,11 +956,27 @@ async def _execute_track_store_with_album_reuse(
 
     buffered_messages = services.chat_message_buffer.peek_flat(chat_id)
     try:
-        track = await prepare_audio_only_track_from_buffer(
-            bot=bot,
-            messages=buffered_messages,
-            album_id=album_id,
-        )
+        try:
+            track = await prepare_audio_only_track_from_buffer(
+                bot=bot,
+                messages=buffered_messages,
+                album_id=album_id,
+            )
+        except TrackInputError:
+            url, artists, title = prepare_link_only_track_from_buffer(messages=buffered_messages)
+            try:
+                downloaded_audio = await download_link_audio(url)
+            except TrackLinkDownloadError:
+                logger.exception('Track link audio download failed')
+                await message.answer(text='Download failed')
+                return
+            track = Track(
+                artists=artists,
+                title=title,
+                audio=downloaded_audio,
+                cover=None,
+                album_id=album_id,
+            )
         group = TrackGroup(universe=universe, year=year, season=season)
         await services.track_store.store(group, sub_season, track=track)
     except TrackInputError, TrackGroupNotFoundError:
@@ -1301,12 +1326,29 @@ def _validate_store_input_at_entry(messages: list[Message]) -> None:
         message.video is not None or getattr(message, 'animation', None) is not None for message in messages
     )
     has_photo = any(message.photo is not None for message in messages)
+    has_audio = any(message.audio is not None for message in messages)
     if has_video:
         raise TrackInputError('Invalid input')
     if has_photo:
         validate_track_batch(extract_store_messages(messages))
         return
-    validate_audio_only_store_input(messages)
+    if has_audio and any(_first_non_empty_line_is_supported_store_link(message.text) for message in messages):
+        raise TrackInputError('Invalid input')
+    try:
+        validate_audio_only_store_input(messages)
+    except TrackInputError:
+        validate_link_only_store_input(messages)
+
+
+def _first_non_empty_line_is_supported_store_link(text: str | None) -> bool:
+    if text is None:
+        return False
+    for line in text.splitlines():
+        normalized_line = line.strip()
+        if not normalized_line:
+            continue
+        return is_supported_youtube_store_url(normalized_line)
+    return False
 
 
 def _album_selection_keyboard(*, album_options: list[tuple[str, str]]) -> InlineKeyboardMarkup:
